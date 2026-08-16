@@ -2,8 +2,8 @@ import socket
 from queue import Queue, Empty
 from threading import Event, Timer
 from time import sleep
-from ..common.common import RelayMessageTypes
-
+from .common import RelayMessageTypes, is_socket_open
+from os import sched_yield
 
         
 
@@ -12,7 +12,7 @@ from ..common.common import RelayMessageTypes
 
 class Relay():
     """open relay connection"""
-    def __init__(self, close: Event, port: int, inbound: Queue[tuple[RelayMessageTypes, str, int, bytes]], outbound: Queue[tuple[RelayMessageTypes, str, int, bytes]], backlog: int = 5, addr: str = '0.0.0.0', sock_kind: socket.SocketKind = socket.SocketKind.SOCK_STREAM):
+    def __init__(self, close: Event, inbound: Queue[tuple[RelayMessageTypes, str, int, bytes]], outbound: Queue[tuple[RelayMessageTypes, str, int, bytes]], port: int = 0, backlog: int = 5, addr: str = '0.0.0.0', sock_kind: socket.SocketKind = socket.SocketKind.SOCK_STREAM):
         self.connection_table: dict[tuple[str,int], socket.socket] = {}
         self.id = 0
         self.backlog = backlog
@@ -24,20 +24,29 @@ class Relay():
         self._sck = socket.socket(socket.AddressFamily.AF_INET, socket.SocketKind.SOCK_STREAM)
         self._sck.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._sck.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        self._sck.setblocking(False)
         # 30 second timeout
         self._sck.settimeout(30.0)
 
-        #(sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1))
+        # for closing *just* this socket
+        self.atomic_close = Event()
+        self.atomic_close.clear()
 
-    def open(self):
         # addr should be 
         self._sck.bind((self.addr, self.port))
+
+
+    def get_port(self) -> int:
+        # if the socket is closed this exceptions out
+        return self._sck.getsockname()[1]
+
+    def open(self):
         # backlog default of five, should make this configurable
         self._sck.listen(self.backlog)
+        self._sck.setblocking(False)
+        assert self._sck.getblocking() == False
 
 
-        while not self.close_req.is_set():
+        while(not self.close_req.is_set()) and (not self.atomic_close.is_set()):
             # accept any new connection (foreign host)
             try:
                 # connection
@@ -51,21 +60,7 @@ class Relay():
             # READ from foreign hosts to our dedicated host
             for addr, con in self.connection_table.items():
                 # check if connection has closed
-                socket_closed = False
-                try:
-                    # MSG_PEEK doesn't consume bytes on the recv buffer
-                    data = con.recv(64, socket.MSG_DONTWAIT | socket.MSG_PEEK)
-                    if len(data) == 0:
-                        socket_closed = True
-                except BlockingIOError:
-                    pass  # Socket is open, it just has no data to read right now
-                except ConnectionResetError:
-                    socket_closed = True   # Connection was abruptly closed or reset by peer
-                except Exception:
-                    socket_closed = True   # Handle other socket errors as closed
-
-                # was this closed?
-                if con.fileno() == -1 or socket_closed:
+                if not is_socket_open(con):
                     # instruct remote client to close connection (is this the correct semantic?)
                     del self.connection_table[addr]
                     self.inbound.put((RelayMessageTypes.CLOSE_CONNECTION, addr[0], addr[1], b''), True)
@@ -107,7 +102,9 @@ class Relay():
 
             except:
                 pass
-                
+
+
+            sched_yield()
             
         # clean up pending connections
 

@@ -1,4 +1,5 @@
 # client side
+import json
 
 if __name__ == "__main__":
     pass
@@ -12,6 +13,16 @@ class Command():
 
 remote = ''
 addr = 1600
+
+# json parse test
+d=b''
+try:
+    d = b'{"apple":1}{}'
+    json.loads(d)
+except json.decoder.JSONDecodeError as e:
+    print(e.msg)
+    print(e.pos)
+    print(d[:e.pos])
 
 # JSON RPC
 # 1. create relay endpoint
