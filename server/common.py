@@ -24,7 +24,8 @@ def grab_json(buffer: bytes) -> tuple[Any, bytes]:
                 return result, buffer[e.pos:]
             except:
                 raise Exception("failed, no data")
-    return (None, b'')
+        else:
+            raise Exception("General JSON fail")
 
 
 GENERIC_JSON_ERROR = json.dumps({
@@ -45,6 +46,18 @@ MISSING_PORT_JSON_ERROR = json.dumps({
 
 MISSING_RELAY_JSON_ERROR = json.dumps({
     "error": "no managed relay matching requested port number"
+}).encode('utf8')
+
+MISSING_ADDRESS_FIELDS = json.dumps({
+    "error": "missing address and/or port field in message"
+}).encode('utf8')
+
+MISSING_DATA_FIELD = json.dumps({
+    "error": "missing data field for data type message"
+}).encode('utf8')
+
+DECODING_ERROR = json.dumps({
+    "error": "failed to base64 decode data payload"
 }).encode('utf8')
 
 UNKNOWN_EVENT_JSON_ERROR = json.dumps({
