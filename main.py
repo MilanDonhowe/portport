@@ -67,6 +67,16 @@ def relayMgmt(s: socket.socket, close: threading.Event):
     inbound_data: Queue[tuple[RelayMessageTypes, str, int, bytes, int]] = Queue()
     relays: Dict[int, tuple[Relay, threading.Thread]] = dict()
 
+    def transmitQ(q: bytes):
+        if len(q) == 0:
+            return q
+        length = s.send(q)
+        if length != -1:
+            q = q[length:]
+        return q
+
+
+    sendq = b''
     buffer = b''
     # on three failed decodes, we kill the connection
     failed_decode = 0
@@ -77,6 +87,11 @@ def relayMgmt(s: socket.socket, close: threading.Event):
           close.set()
           continue
         
+        # any data left on the queue
+        try:
+            sendq = transmitQ(sendq)
+        except BlockingIOError:
+            pass
 
         # check: message from client
         try:
@@ -107,11 +122,14 @@ def relayMgmt(s: socket.socket, close: threading.Event):
                                     new_relay_thread.start()
 
                                     # notify client
-                                    s.sendall(json.dumps({
+                                    sendq += json.dumps({
                                         "type": "control",
                                         "event": "open_relay",
                                         "port": new_relay.get_port()
-                                    }).encode('utf8'))
+                                    }).encode('utf8')
+
+                                    sendq = transmitQ(sendq)
+
                                 # if local service closes connection
                                 elif json_result["event"] == "close_connection":
                                     relay, relay_t = relays[json_result['relay_port']]
@@ -128,39 +146,51 @@ def relayMgmt(s: socket.socket, close: threading.Event):
                                             # remove from relay table
                                             del relays[port]
                                             # successful result
-                                            s.sendall(json.dumps({"type":"control", "event":"relay_closed","port": port}).encode('utf8'))
+                                            sendq += json.dumps({"type":"control", "event":"relay_closed","port": port}).encode('utf8')
+
+                                            sendq = transmitQ(sendq)
                                         else:
-                                            s.sendall(MISSING_RELAY_JSON_ERROR)
+                                            sendq += MISSING_RELAY_JSON_ERROR
+                                            sendq = transmitQ(sendq)
                                     else:
-                                        s.sendall(MISSING_PORT_JSON_ERROR)
+                                        sendq += MISSING_PORT_JSON_ERROR
+                                        sendq = transmitQ(sendq)
                                 else:
-                                    s.sendall(UNKNOWN_EVENT_JSON_ERROR)
+                                    sendq += UNKNOWN_EVENT_JSON_ERROR
+                                    sendq = transmitQ(sendq)
 
                             else:
-                                s.sendall(BAD_EVENT_JSON_ERROR)
+                                sendq += BAD_EVENT_JSON_ERROR
+                                sendq = transmitQ(sendq)
                             pass
                         elif json_result["type"] == 'data':
                             if 'address' not in json_result or 'port' not in json_result or 'relay_port' not in json_result:
-                                s.sendall(MISSING_ADDRESS_FIELDS)
+                                sendq += MISSING_ADDRESS_FIELDS
+                                sendq = transmitQ(sendq)
                             elif "data" in json_result:
                                 try:
                                     data = b64decode(json_result['data'])
                                     # this data goes to foreign host
                                     if json_result['relay_port'] not in relays:
-                                        s.sendall(MISSING_RELAY_JSON_ERROR)
+                                        sendq += MISSING_RELAY_JSON_ERROR
+                                        sendq = transmitQ(sendq)
                                     else:
                                         # data from client to foreign connection
                                         relay = relays[json_result['relay_port']][0]
                                         # identifying port is a bit redundant here but including it for uniformity between inbound/outbound queues
                                         relay.outbound.put((RelayMessageTypes.MESSAGE, json_result['address'], json_result['port'], data, json_result['relay_port']))
                                 except:
-                                    s.sendall(DECODING_ERROR)
+                                    sendq += DECODING_ERROR
+                                    sendq = transmitQ(sendq)
                             else:
-                                s.sendall(MISSING_DATA_FIELD)
+                                sendq += MISSING_DATA_FIELD
+                                sendq = transmitQ(sendq)
                         else:
-                            s.sendall(BAD_TYPE_JSON_ERROR)
+                            sendq += BAD_TYPE_JSON_ERROR
+                            sendq = transmitQ(sendq)
                     else:
-                        s.sendall(GENERIC_JSON_ERROR)        
+                        sendq += GENERIC_JSON_ERROR
+                        sendq = transmitQ(sendq)       
                     # we got all the way here with no error?
                     failed_decode=0
                 except:
@@ -175,37 +205,46 @@ def relayMgmt(s: socket.socket, close: threading.Event):
 
         # check: inbound message to send?
         try:
+
             # should I handle more than one message at a time?
             msg_type, con_addr, con_port, data, relay_port = inbound_data.get_nowait()
             if msg_type == RelayMessageTypes.MESSAGE:
-                s.sendall(json.dumps({
+                sendq += json.dumps({
                     "type":"data",
                     "address": con_addr,
                     "port": con_port,
                     "relay_port": relay_port,
                     "data": b64encode(data).decode('utf8')
-                }).encode("utf8"))
+                }).encode("utf8")
+
+                sendq = transmitQ(sendq)
+
             # notify new connection
             elif msg_type == RelayMessageTypes.NEW_CONNECTION:
-                s.sendall(json.dumps({
+                sendq += json.dumps({
                     "type": "control",
                     "event": "new_connection",
                     "address": con_addr,
                     "port": con_port,
                     "relay_port": relay_port
-                }).encode('utf8'))
+                }).encode('utf8')
+
+                sendq = transmitQ(sendq)
+
             elif msg_type == RelayMessageTypes.CLOSE_CONNECTION:
-                s.sendall(json.dumps({
+                sendq += json.dumps({
                     "type": "control",
                     "event": "close_connection",
                     "address": con_addr,
                     "port": con_port,
                     "relay_port": relay_port
-                }).encode('utf8'))
+                }).encode('utf8')
+                sendq = transmitQ(sendq)
             else:
                 # really, we should probably raise some sort of exception here since this code path implies some unaccounted for inbound message
                 # from a proxied host payload intended for our client but for now I'm going to ignore it :)
                 pass
+
         except Empty:
             pass
 
@@ -226,8 +265,6 @@ while not service_close_event.is_set():
     try:
         sck, addr = main_server.accept()
         print("[*] creating new relay management thread")
-
-
         connection_table[addr]= threading.Thread(target=relayMgmt, args=(sck,service_close_event,))
         connection_table[addr].start()
     except BlockingIOError:

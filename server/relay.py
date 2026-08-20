@@ -13,7 +13,7 @@ from os import sched_yield
 class Relay():
     """open relay connection"""
     def __init__(self, close: Event, inbound: Queue[tuple[RelayMessageTypes, str, int, bytes, int]], outbound: Queue[tuple[RelayMessageTypes, str, int, bytes, int]], port: int = 0, backlog: int = 5, addr: str = '0.0.0.0', sock_kind: socket.SocketKind = socket.SocketKind.SOCK_STREAM):
-        self.connection_table: dict[tuple[str,int], socket.socket] = {}
+        self.connection_table: dict[tuple[str,int], tuple[socket.socket, bytes]] = {}
         self.id = 0
         self.backlog = backlog
         self.port = port
@@ -55,7 +55,7 @@ class Relay():
                 con, addr = self._sck.accept()
                 # ensure that con should be non-blocking
                 con.setblocking(False)
-                self.connection_table[addr] = con
+                self.connection_table[addr] = (con, b'')
                 # new message created
                 print(f"[*] new connection on {addr} for relay port {self.identifying_port}")
                 self.inbound.put((RelayMessageTypes.NEW_CONNECTION, addr[0], addr[1], b'', self.identifying_port), True)
@@ -71,7 +71,7 @@ class Relay():
             addresses = list(self.connection_table.keys())
             for addr in addresses:
                 # get connection socket (con)
-                con = self.connection_table[addr]
+                con, _q = self.connection_table[addr]
                 # check if connection has closed
                 if not is_socket_open(con):
                     # instruct remote client to close connection (is this the correct semantic?)
@@ -94,21 +94,30 @@ class Relay():
                 def set_write_exceed():
                     write_exceed.set()
 
-                t = Timer(1.0, set_write_exceed)
+                t = Timer(0.3, set_write_exceed)
                 t.start()
-                while (not write_exceed.is_set()) and (not self.outbound.empty()):
-                    msg, address, port, data, _id_port = self.outbound.get(True)
-                    con = self.connection_table[(address, port)]
-                    if msg == RelayMessageTypes.MESSAGE:
-                        # what if (addr, port) don't exist in the table?
-                        # what if exception?
-                        con.sendall(data)
-                    if msg == RelayMessageTypes.CLOSE_CONNECTION:
-                        con.close()
-                    else:
-                        # SHOULD RAISE ERROR
-                        # we cannot have any other relay message types
-                        pass
+                while (not write_exceed.is_set()) and (not (self.outbound.qsize() == 0)):
+                    try:
+                        msg, address, port, data, _id_port = self.outbound.get()
+                        con, send_queue = self.connection_table[(address, port)]
+                        send_queue = send_queue + data
+                        if msg == RelayMessageTypes.MESSAGE:
+                            # what if (addr, port) don't exist in the table?
+                            # what if exception?
+                            sent = con.send(send_queue)
+                            if sent == -1:
+                                raise Exception("Error sending bytes on socket")
+                            else:
+                                send_queue = send_queue[sent:]
+                                self.connection_table[(address, port)] = (con, send_queue)
+                        if msg == RelayMessageTypes.CLOSE_CONNECTION:
+                            con.close()
+                        else:
+                            # SHOULD RAISE ERROR
+                            # we cannot have any other relay message types
+                            pass
+                    except BlockingIOError:
+                        break
                 # cancel timer if not yet completed
                 t.cancel()
 
@@ -120,7 +129,7 @@ class Relay():
             sched_yield()
             
         # clean up pending connections
-        for sock in self.connection_table.values():
+        for sock, _q in self.connection_table.values():
             # doesn't matter if we call ".close()" on a closed socket it should NOT raise an exception
             sock.close()
 

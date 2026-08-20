@@ -127,11 +127,11 @@ def create_remote_proxy(close: Event):
     data = client_connection.recv(4096)
     # switch to non-blocking
     client_connection.setblocking(False)
+    sendq = bytes()
 
     result, data = grab_json(data)
     remote_port = result['port']
     print("[*] created relay on remote port: ", remote_port)
-    print(client_connection.getblocking())
     # create local binding
     to_remote_proxy: Queue[tuple[RelayMessageTypes, str, int, bytes, int]]  = Queue()
     from_remote_proxy: Queue[tuple[RelayMessageTypes, str, int, bytes, int]]  = Queue()
@@ -181,27 +181,42 @@ def create_remote_proxy(close: Event):
 
         # do we have any data to send back?
         try:
+            # anything stuck on the queue?
+            if len(sendq) > 0:
+                try:
+                    sent_len = client_connection.send(sendq)
+                    if sent_len != -1:
+                        sendq = sendq[sent_len:]
+                except BlockingIOError:
+                    pass
+            # check message queue 
             msgType, addr, port, outbound_data, r_port = to_remote_proxy.get_nowait()
             if msgType == RelayMessageTypes.CLOSE_CONNECTION:
                 try:
-                    client_connection.sendall(json.dumps({
+                    sendq += json.dumps({
                         "type": "control",
                         "event": "close_connection",
                         "address": addr,
                         "port": port,
                         "relay_port": r_port
-                    }).encode("utf8"))
+                    }).encode("utf8")
+                    sent_len = client_connection.send(sendq)
+                    if sent_len != -1:
+                        sendq = sendq[sent_len:]
                 except BlockingIOError:
                     # if this blocks, we have an error
                     close.set()
             elif msgType == RelayMessageTypes.MESSAGE:
-                client_connection.sendall((json.dumps({
+                sendq += json.dumps({
                     "type":"data",
                     "address": addr,
                     "port": port,
                     "relay_port": r_port,
                     "data": b64encode(outbound_data).decode('utf8')
-                }).encode("utf8")))
+                }).encode("utf8")
+                sent_len = client_connection.send(sendq)
+                if sent_len != -1:
+                    sendq = sendq[sent_len:]
             else:
                 pass
         except Empty:
