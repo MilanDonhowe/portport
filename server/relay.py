@@ -4,7 +4,8 @@ from threading import Event, Timer
 from time import sleep
 from .common import RelayMessageTypes, is_socket_open
 from os import sched_yield
-
+# I'm an idiot, use DefaultSelector lol
+from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
         
 
 # outbound : foreign <- relay <- dedicated client
@@ -13,7 +14,9 @@ from os import sched_yield
 class Relay():
     """open relay connection"""
     def __init__(self, close: Event, inbound: Queue[tuple[RelayMessageTypes, str, int, bytes, int]], outbound: Queue[tuple[RelayMessageTypes, str, int, bytes, int]], port: int = 0, backlog: int = 5, addr: str = '0.0.0.0', sock_kind: socket.SocketKind = socket.SocketKind.SOCK_STREAM):
-        self.connection_table: dict[tuple[str,int], tuple[socket.socket, bytes]] = {}
+        self.connection_table: dict[tuple[str,int], socket.socket] = {}
+        self.connection_queues: dict[tuple[str,int], bytes] = {}
+
         self.id = 0
         self.backlog = backlog
         self.port = port
@@ -31,10 +34,47 @@ class Relay():
         self.atomic_close = Event()
         self.atomic_close.clear()
 
+        # selector for multiplexing sockets
+        self.selector = DefaultSelector()
+
         # addr should be 
         self._sck.bind((self.addr, self.port))
         self.identifying_port = self.get_port()
         print(f"[*] new relay running at port {self.identifying_port}")
+
+    def accept_inbound_connection(self, sock: socket.socket, mask: int):
+        """accept new connection"""
+        conn, addr = sock.accept()
+        conn.setblocking(False)
+        self.connection_table[addr] = conn
+        self.connection_queues[addr] = b''
+        self.selector.register(conn, EVENT_READ | EVENT_WRITE, self.handle_socket)
+        self.inbound.put((RelayMessageTypes.NEW_CONNECTION, addr[0], addr[1], b'', self.identifying_port))
+
+    def clean_up_connection(self, sock: socket.socket, addr: tuple[str, int]):
+        self.inbound.put((RelayMessageTypes.CLOSE_CONNECTION, addr[0], addr[1], b'', self.identifying_port))
+        del self.connection_queues[addr]
+        del self.connection_table[addr]
+        self.selector.unregister(sock)
+
+    def handle_socket(self, sock: socket.socket, mask: int):
+        """i/o on external socket connection to our relay"""
+        # retrieve send queue
+        addr = sock.getpeername()
+        sendq = self.connection_queues[addr]
+        if mask & EVENT_WRITE and len(sendq) > 0:
+            sent_length = sock.send(sendq)
+            self.connection_queues[addr] = sendq[sent_length:]
+        if mask & EVENT_READ:
+            # received data gets funneled to relay client (handled by relay mgmt)
+            try:
+                data = sock.recv(4096)
+                if len(data) == 0:
+                    self.clean_up_connection(sock, addr)
+                else:
+                    self.inbound.put((RelayMessageTypes.MESSAGE, addr[0], addr[1], data, self.identifying_port))
+            except (ConnectionResetError, BrokenPipeError):
+                self.clean_up_connection(sock, addr)
 
 
     def get_port(self) -> int:
@@ -46,79 +86,26 @@ class Relay():
         self._sck.listen(self.backlog)
         self._sck.setblocking(False)
         assert self._sck.getblocking() == False
+        self.selector.register(self._sck, EVENT_READ, self.accept_inbound_connection)
 
-        #write_exceed = Event()      
-        #write_exceed.clear()
-        #def set_write_exceed():
-        #    write_exceed.set()
-        #write_timer = Timer(0.3, set_write_exceed)
-
-
-        while(not self.close_req.is_set()) and (not self.atomic_close.is_set()):
-            # accept any new connection (foreign host)
+        while (not self.close_req.is_set() and (not self.atomic_close.is_set())):
+            events = self.selector.select()
+            for key, mask in events:
+                callback = key.data
+                callback(key.fileobj, mask)
+            
+            # update based on relay mgmt inbound data
             try:
-                # connection
-                con, addr = self._sck.accept()
-                # ensure that con should be non-blocking
-                con.setblocking(False)
-                self.connection_table[addr] = (con, b'')
-                # new message created
-                print(f"[*] new connection on {addr} for relay port {self.identifying_port}")
-                self.inbound.put((RelayMessageTypes.NEW_CONNECTION, addr[0], addr[1], b'', self.identifying_port), True)
-            except BlockingIOError:
-                pass
-
-            # READ from foreign hosts to our dedicated host
-
-            # we cannot remove entries from the dictionary in-place while iterating through it (unfortunately).
-            # this is probably because the dictionary iterator logic cannot confirm that the key we deleted has 
-            # already been safely passed by the iterator at runtime.
-            # we create a copy of the dictionary keys and iterate through that instead
-            addresses = list(self.connection_table.keys())
-            for addr in addresses:
-                # get connection socket (con)
-                con, _q = self.connection_table[addr]
-                # check if connection has closed
-                if not is_socket_open(con):
-                    # instruct remote client to close connection (is this the correct semantic?)
-                    del self.connection_table[addr]
-                    self.inbound.put((RelayMessageTypes.CLOSE_CONNECTION, addr[0], addr[1], b'', self.identifying_port), True)
-                    continue
-
-                # do we have any data to forward to the dedicated cilent?
-                try:
-                    data = con.recv(4096)
-                    if len(data) == 0:
-                        # normal EOF
-                        con.close()
-                        self.inbound.put((RelayMessageTypes.CLOSE_CONNECTION, addr[0], addr[1], data, self.identifying_port), True)
-                    else:
-                        self.inbound.put((RelayMessageTypes.MESSAGE, addr[0], addr[1], data, self.identifying_port), True)
-                except BlockingIOError:
-                    pass
-            # WRITE to foreign hosts
-            try:
-                # TODO: maybe refactor? Unsure of the efficiency here
                 # need timeout or select here
                 while not (self.outbound.qsize() == 0):
                     try:
-                        msg, address, port, data, _id_port = self.outbound.get()
-                        con, send_queue = self.connection_table[(address, port)]
-                        send_queue = send_queue + data
-                        # update send queue (prevents dropping messages if .send raises block exception)
-                        self.connection_table[(address, port)] = (con, send_queue)
-
+                        msg, address, port, data, _id_port = self.outbound.get_nowait()
+                        con = self.connection_table[(address, port)]
                         if msg == RelayMessageTypes.MESSAGE:
-                            # what if (addr, port) don't exist in the table?
-                            # what if exception?
-                            sent = con.send(send_queue)
-                            if sent == -1:
-                                raise Exception("Error sending bytes on socket")
-                            else:
-                                send_queue = send_queue[sent:]
-                                self.connection_table[(address, port)] = (con, send_queue)
+                             self.connection_queues[(address, port)] += data
                         if msg == RelayMessageTypes.CLOSE_CONNECTION:
                             con.close()
+                            self.clean_up_connection(con, (address, port))
                         else:
                             # SHOULD RAISE ERROR
                             # we cannot have any other relay message types
@@ -130,9 +117,10 @@ class Relay():
 
 
             sched_yield()
+
         print("[*] cleaning up connections")
         # clean up pending connections
-        for sock, _q in self.connection_table.values():
+        for sock in self.connection_table.values():
             # doesn't matter if we call ".close()" on a closed socket it should NOT raise an exception
             sock.close()
 
