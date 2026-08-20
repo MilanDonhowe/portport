@@ -47,6 +47,12 @@ class Relay():
         self._sck.setblocking(False)
         assert self._sck.getblocking() == False
 
+        #write_exceed = Event()      
+        #write_exceed.clear()
+        #def set_write_exceed():
+        #    write_exceed.set()
+        #write_timer = Timer(0.3, set_write_exceed)
+
 
         while(not self.close_req.is_set()) and (not self.atomic_close.is_set()):
             # accept any new connection (foreign host)
@@ -82,25 +88,26 @@ class Relay():
                 # do we have any data to forward to the dedicated cilent?
                 try:
                     data = con.recv(4096)
-                    self.inbound.put((RelayMessageTypes.MESSAGE, addr[0], addr[1], data, self.identifying_port), True)
+                    if len(data) == 0:
+                        # normal EOF
+                        con.close()
+                        self.inbound.put((RelayMessageTypes.CLOSE_CONNECTION, addr[0], addr[1], data, self.identifying_port), True)
+                    else:
+                        self.inbound.put((RelayMessageTypes.MESSAGE, addr[0], addr[1], data, self.identifying_port), True)
                 except BlockingIOError:
                     pass
             # WRITE to foreign hosts
             try:
                 # TODO: maybe refactor? Unsure of the efficiency here
-                write_exceed = Event()
-                
-                write_exceed.clear()
-                def set_write_exceed():
-                    write_exceed.set()
-
-                t = Timer(0.3, set_write_exceed)
-                t.start()
-                while (not write_exceed.is_set()) and (not (self.outbound.qsize() == 0)):
+                # need timeout or select here
+                while not (self.outbound.qsize() == 0):
                     try:
                         msg, address, port, data, _id_port = self.outbound.get()
                         con, send_queue = self.connection_table[(address, port)]
                         send_queue = send_queue + data
+                        # update send queue (prevents dropping messages if .send raises block exception)
+                        self.connection_table[(address, port)] = (con, send_queue)
+
                         if msg == RelayMessageTypes.MESSAGE:
                             # what if (addr, port) don't exist in the table?
                             # what if exception?
@@ -118,16 +125,12 @@ class Relay():
                             pass
                     except BlockingIOError:
                         break
-                # cancel timer if not yet completed
-                t.cancel()
-
             except:
-                print("timer fail")
                 pass
 
 
             sched_yield()
-            
+        print("[*] cleaning up connections")
         # clean up pending connections
         for sock, _q in self.connection_table.values():
             # doesn't matter if we call ".close()" on a closed socket it should NOT raise an exception

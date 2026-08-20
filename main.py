@@ -98,10 +98,15 @@ def relayMgmt(s: socket.socket, close: threading.Event):
             # data should be a valid json payload
             prior_payload_len = len(buffer)
             data = s.recv(8096)
+            if len(data) == 0:
+                # handle EOF
+                print('[*] EOF from relay mgmt client')
+                close.set()
+                continue
             buffer = buffer + data
             
             # no new data?
-            if prior_payload_len < len(buffer):
+            if prior_payload_len < len(buffer) or failed_decode == 0:
  
                 try:
                     json_result, rem = grab_json(buffer)

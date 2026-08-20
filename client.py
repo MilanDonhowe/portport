@@ -31,17 +31,19 @@ def create_local_proxy(local_port: int, remote_port: int, close_event: Event, to
     # inbound = data from local service
     # outbound = data to local service
 
-    connections: dict[tuple[str,int], socket] = {}
+    connections: dict[tuple[str,int], tuple[socket, bytes]] = {}
     while not close_event.is_set():
         # handle inbound data from relay
         try:
             msg_type, addr, port, data, _r_port = to_local.get_nowait()
+
+
             if msg_type == RelayMessageTypes.NEW_CONNECTION:
-                connections[(addr,port)] = socket(AddressFamily.AF_INET, SocketKind.SOCK_STREAM)
-                connections[(addr,port)].setsockopt(SOL_SOCKET, SO_KEEPALIVE, 1)
+                connections[(addr,port)] = (socket(AddressFamily.AF_INET, SocketKind.SOCK_STREAM), b'')
+                connections[(addr,port)][0].setsockopt(SOL_SOCKET, SO_KEEPALIVE, 1)
                 try:
-                    connections[(addr,port)].connect(('0.0.0.0', local_port))
-                    connections[(addr,port)].setblocking(False)
+                    connections[(addr,port)][0].connect(('0.0.0.0', local_port))
+                    connections[(addr,port)][0].setblocking(False)
                 except ConnectionRefusedError:
                     to_proxy.put((RelayMessageTypes.CLOSE_CONNECTION, addr, port, b'', remote_port))
                     continue
@@ -52,14 +54,19 @@ def create_local_proxy(local_port: int, remote_port: int, close_event: Event, to
                     print("ERR: data from unknown connection " + addr + ":" + str(port))
                     to_proxy.put((RelayMessageTypes.CLOSE_CONNECTION, addr, port, b'', remote_port))
                     continue
-                sock = connections[(addr,port)]
+                sock, sendq = connections[(addr,port)]
                 if not is_socket_open(sock):
                     to_proxy.put((RelayMessageTypes.CLOSE_CONNECTION, addr, port, b'', remote_port))
                     continue
                 # data should be already decoded
-                sock.sendall(data)
+                sendq += data
+                sent_len = sock.send(sendq)
+                if sent_len != -1:
+                    sendq = sendq[sent_len:]
+                connections[(addr,port)] = (sock, sendq)
+
             elif msg_type == RelayMessageTypes.CLOSE_CONNECTION:
-                connections[(addr,port)].close()
+                connections[(addr,port)][0].close()
                 del connections[(addr,port)]
             else:
                 # should error
@@ -68,19 +75,28 @@ def create_local_proxy(local_port: int, remote_port: int, close_event: Event, to
             pass
 
         # each connection check, collect and send outbound data for remote relay
-        for (conn_addr, conn_port), conn in connections.items():
+        for (conn_addr, conn_port), (conn, sendq) in connections.items():
             assert conn.getblocking() == False
             # ensure all queued data is shoved into queue
             exhausted=False
             while (not exhausted) and (not close_event.is_set()):
                 try:
                     data = conn.recv(4096)
-                    to_proxy.put((RelayMessageTypes.MESSAGE, conn_addr, conn_port, data, remote_port))
+                    if len(data) == 0:
+                        # EOF
+                        to_proxy.put((RelayMessageTypes.CLOSE_CONNECTION, conn_addr, conn_port, data, remote_port))
+                    else:
+                        to_proxy.put((RelayMessageTypes.MESSAGE, conn_addr, conn_port, data, remote_port))
                 except BlockingIOError:
                     exhausted=True
                 except:
                     exhausted=True
-        
+            # ensure all data sent
+            if len(sendq) > 0:
+                sent_len = conn.send(sendq)
+                if sent_len != -1:
+                    sendq = sendq[sent_len:]
+                connections[(conn_addr,conn_port)]=(conn,sendq)
         sched_yield()
 # hard coding this for testing
 LOCAL_PORT = 1234
@@ -118,7 +134,7 @@ signal.signal(signal.SIGTERM, ctrl_c_handler)
 
 def create_remote_proxy(close: Event):
     # 1. create relay connection on remote server
-    print("[*] requesting relay")
+    print("[*] requesting relay for service hosted on port " + str(LOCAL_PORT))
     client_connection.sendall(json.dumps({
         "type": "control",
         "event": "create_relay"
@@ -148,7 +164,12 @@ def create_remote_proxy(close: Event):
         while not exhausted and not close.is_set():
             try:
                 payload = client_connection.recv(4096)
+                if len(payload) == 0:
+                    # EOF handling
+                    print("[*] normal EOF, graceful shutdown")
+                    close.set()
                 data = data + payload
+                
             except ConnectionResetError:
                 print("[*] relay service went down, exiting.")
                 close.set()
