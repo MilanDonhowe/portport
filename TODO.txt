@@ -1,0 +1,4 @@
+
+- openssl encrypted setup between server + client
+- telemetry with grafana?
+- test suite
