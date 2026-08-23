@@ -63,8 +63,15 @@ class Relay():
         addr = sock.getpeername()
         sendq = self.connection_queues[addr]
         if mask & EVENT_WRITE and len(sendq) > 0:
-            sent_length = sock.send(sendq)
-            self.connection_queues[addr] = sendq[sent_length:]
+            try:
+                sent_length = sock.send(sendq)
+                self.connection_queues[addr] = sendq[sent_length:]
+            except (BrokenPipeError, ConnectionResetError):
+                # blocking IO shouldn't happen afaik
+                self.clean_up_connection(sock, addr)
+            except BlockingIOError:
+                # this normally shouldn't happen but if it does let's keep chugging along
+                pass
         if mask & EVENT_READ:
             # received data gets funneled to relay client (handled by relay mgmt)
             try:
@@ -87,9 +94,11 @@ class Relay():
         self._sck.setblocking(False)
         assert self._sck.getblocking() == False
         self.selector.register(self._sck, EVENT_READ, self.accept_inbound_connection)
+        print("[*] spawned relay")
 
         while (not self.close_req.is_set() and (not self.atomic_close.is_set())):
-            events = self.selector.select()
+
+            events = self.selector.select(timeout=5)
             for key, mask in events:
                 callback = key.data
                 callback(key.fileobj, mask)
@@ -97,23 +106,26 @@ class Relay():
             # update based on relay mgmt inbound data
             try:
                 # need timeout or select here
-                while not (self.outbound.qsize() == 0):
+                while not (self.outbound.qsize() == 0) and not self.close_req.is_set() and (not self.atomic_close.is_set()):
                     try:
                         msg, address, port, data, _id_port = self.outbound.get_nowait()
                         con = self.connection_table[(address, port)]
                         if msg == RelayMessageTypes.MESSAGE:
                              self.connection_queues[(address, port)] += data
-                        if msg == RelayMessageTypes.CLOSE_CONNECTION:
+                        elif msg == RelayMessageTypes.CLOSE_CONNECTION:
                             con.close()
                             self.clean_up_connection(con, (address, port))
                         else:
                             # SHOULD RAISE ERROR
                             # we cannot have any other relay message types
-                            pass
+                            raise Exception("Processing error: invalid relay message type!")
+                            
                     except BlockingIOError:
                         break
-            except:
-                pass
+            except Exception as e:
+                print("UNKNOWN EXCEPTION HIT")
+                print(e)
+                self.atomic_close.set()
 
 
             sched_yield()
@@ -123,8 +135,9 @@ class Relay():
         for sock in self.connection_table.values():
             # doesn't matter if we call ".close()" on a closed socket it should NOT raise an exception
             sock.close()
-
         self._sck.close()
+        self.selector.close()
+        print("[*] relay connections cleaned up!")
         
 
     def close(self):

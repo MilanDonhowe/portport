@@ -7,6 +7,10 @@ class RelayMessageTypes(IntEnum):
     CLOSE_CONNECTION = auto()
     MESSAGE = auto()
 
+def valid_msg(json_msg: dict) -> bool:
+    # TODO: validate this in future
+    return True
+
 def grab_json(buffer: bytes) -> tuple[Any, bytes]:
     """
     given buffer containing n valid json objects: [a, b, c, ...]
@@ -68,6 +72,9 @@ def is_socket_open(s:socket) -> bool:
     """
     checks if a socket is in an open state
     """
+    if s.fileno() == -1:
+        return False
+
     try:
         # MSG_PEEK doesn't consume bytes on the recv buffer
         data = s.recv(64, MSG_DONTWAIT | MSG_PEEK)
@@ -79,9 +86,6 @@ def is_socket_open(s:socket) -> bool:
         return False # connection closed or reset by peer
     except Exception:
         return False # other issue
-
-    if s.fileno() == -1:
-        return False
     
     return True
 
