@@ -9,7 +9,7 @@ import json
 import threading
 from os import sched_yield
 from types import FrameType
-from server.relay import Relay
+from server.relay import Relay, RELAY_SERVER_LOGGER_NAME
 from typing import Dict
 from base64 import b64decode, b64encode
 from selectors import DefaultSelector, EVENT_WRITE, EVENT_READ
@@ -19,7 +19,7 @@ import argparse
 
 RELAY_MGMT_PORT = 1600 
 RELAY_MGMT_ADDR = "0.0.0.0"
-logger = getLogger("portport-server")
+logger = getLogger(RELAY_SERVER_LOGGER_NAME)
 
 
 service_close_event = threading.Event()

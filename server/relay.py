@@ -7,9 +7,7 @@ from os import sched_yield
 import logging
 from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
         
-
-# outbound : foreign <- relay <- dedicated client
-# inbound : foreign -> relay -> dedicated client
+RELAY_SERVER_LOGGER_NAME = "portport-server"
 
 class Relay():
     """open relay connection"""
@@ -17,6 +15,7 @@ class Relay():
         self.connection_table: dict[tuple[str,int], socket.socket] = {}
         self.connection_queues: dict[tuple[str,int], bytes] = {}
 
+        self.logger = logging.getLogger(RELAY_SERVER_LOGGER_NAME)
         self.id = 0
         self.backlog = backlog
         self.port = port
@@ -40,7 +39,7 @@ class Relay():
         # addr should be 
         self._sck.bind((self.addr, self.port))
         self.identifying_port = self.get_port()
-        print(f"[*] new relay running at port {self.identifying_port}")
+        self.logger.info(f"new relay initialized at port {self.identifying_port}")
 
     def accept_inbound_connection(self, sock: socket.socket, mask: int):
         """accept new connection"""
@@ -97,7 +96,7 @@ class Relay():
         self._sck.setblocking(False)
         assert self._sck.getblocking() == False
         self.selector.register(self._sck, EVENT_READ, self.accept_inbound_connection)
-        print("[*] spawned relay")
+        self.logger.info(f"relay listening on port={self.identifying_port} ")
 
         while (not self.close_req.is_set() and (not self.atomic_close.is_set())):
 
@@ -125,22 +124,21 @@ class Relay():
                     except BlockingIOError:
                         break
             except KeyError:
-                print("unknown connection referenced, ignoring...")
+                self.logger.warning("unknown connection referenced, ignoring...")
             except Exception as e:
-                print("UNKNOWN EXCEPTION HIT")
-                print(e)
+                self.logger.error("UNKNOWN EXCEPTION HIT", extra={"exception": e})
                 self.atomic_close.set()
 
 
             sched_yield()
 
-        print("[*] cleaning up connections")
+        self.logger.info(f"closing relay port={self.identifying_port}, cleaning up existing connections")
         # clean up pending connections
         for sock in self.connection_table.values():
             # doesn't matter if we call ".close()" on a closed socket it should NOT raise an exception
             sock.close()
         self._sck.close()
         self.selector.close()
-        print("[*] relay connections cleaned up!")
+        self.logger.info(f"cleaned up connections for relay port={self.identifying_port}.  Relay successfully closed!")
         
 

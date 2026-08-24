@@ -24,6 +24,8 @@ def valid_msg(json_msg: dict) -> bool:
     # TODO: validate this in future
     return True
 
+
+
 def grab_json(buffer: bytes) -> tuple[Any, bytes]:
     """
     given buffer containing n valid json objects: [a, b, c, ...]
