@@ -1,3 +1,4 @@
+import logging, sys
 from enum import IntEnum, auto
 import json
 from socket import socket, MSG_DONTWAIT, MSG_PEEK
@@ -6,6 +7,18 @@ class RelayMessageTypes(IntEnum):
     NEW_CONNECTION = auto()
     CLOSE_CONNECTION = auto()
     MESSAGE = auto()
+
+
+def configure_logger(verbose: bool = False):
+    """configure logger"""
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format=(
+            "[*][%(asctime)s][%(levelname)s][%(threadName)s]: %(message)s"
+        ),
+        stream=sys.stderr,
+    )
+    pass
 
 def valid_msg(json_msg: dict) -> bool:
     # TODO: validate this in future

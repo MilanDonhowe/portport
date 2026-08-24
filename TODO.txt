@@ -1,4 +1,8 @@
 
 - openssl encrypted setup between server + client
+- non-trash CLI
+- easy to use optional web UI
+- docker deployment support?
 - telemetry with grafana?
 - test suite
+

@@ -4,7 +4,7 @@ from threading import Event, Timer
 from time import sleep
 from .common import RelayMessageTypes, is_socket_open
 from os import sched_yield
-# I'm an idiot, use DefaultSelector lol
+import logging
 from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
         
 

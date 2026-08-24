@@ -20,14 +20,44 @@ from queue import Queue, Empty
 import signal, sys
 from types import FrameType
 import json
-from server.common import grab_json, is_socket_open
+from server.common import grab_json, is_socket_open, configure_logger
 from base64 import b64encode, b64decode
 from os import sched_yield
 from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
 from typing import List
 import ssl
+import argparse
+import logging
 
-proxy_threads = {}
+
+logger = logging.getLogger("portport-client")
+
+
+
+
+# DEFAULTS
+LOCAL_PORT = 1234
+REMOTE_MGMT_SERVICE = "127.0.0.1"
+REMOTE_MGMT_SERVICE_PORT = 1600
+
+
+close_service = Event()
+close_service.clear()
+
+def ctrl_c_handler(signum: int, frame: FrameType | None):
+    """
+    Function executed when Ctrl+C is pressed.
+    signum: The signal number (usually 2 for SIGINT)
+    frame: The current stack frame object
+    """
+    logger.error("Ctrl+C pressed! Performing safe shutdown...")
+    close_service.set()
+
+    # closes main thread
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, ctrl_c_handler)
+signal.signal(signal.SIGTERM, ctrl_c_handler)
 
 class ProxiedConnection():
     """local socket connection"""
@@ -100,7 +130,7 @@ def create_local_proxy(local_port: int, remote_port: int, close_event: Event, to
                     # check if socket online, then sendall
                     if (addr,port) not in connections:
                         # this should error, we're sending data to a connection we haven't setup yet
-                        print("ERR: data from unknown connection " + addr + ":" + str(port))
+                        logger.debug("ERR: data from unknown connection " + addr + ":" + str(port))
                         to_proxy.put((RelayMessageTypes.CLOSE_CONNECTION, addr, port, b'', remote_port))
                         continue
                     # data should be already decoded from base64
@@ -139,69 +169,39 @@ def create_local_proxy(local_port: int, remote_port: int, close_event: Event, to
         for addr in to_remove:
             del connections[addr]
         sched_yield()
-# hard coding this for testing
-LOCAL_PORT = 1234
 
-# rn this is on local for testing
-REMOTE_MGMT_SERVICE = "0.0.0.0"
-REMOTE_MGMT_SERVICE_PORT = 1600
 
-# setup TLS
-context = ssl.create_default_context()
-context.load_verify_locations("cert.pem")
 
-# connection to relay server
-client_connection = socket(AddressFamily.AF_INET, SocketKind.SOCK_STREAM)
-client_connection.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-client_connection.setsockopt(SOL_SOCKET, SO_KEEPALIVE, 1)
 
-client_connection_ssl = context.wrap_socket(client_connection, server_hostname="localhost")
-client_connection_ssl.connect(('0.0.0.0', REMOTE_MGMT_SERVICE_PORT))
-
-close_service = Event()
-close_service.clear()
-
-def ctrl_c_handler(signum: int, frame: FrameType | None):
-    """
-    Function executed when Ctrl+C is pressed.
-    signum: The signal number (usually 2 for SIGINT)
-    frame: The current stack frame object
-    """
-    print("\n[*][Intercepted] Ctrl+C pressed! Performing safe shutdown...")
-    close_service.set()
-
-    # closes main thread
-    sys.exit(0)
-
-signal.signal(signal.SIGINT, ctrl_c_handler)
-signal.signal(signal.SIGTERM, ctrl_c_handler)
 
 
 # start up procedures
 
-def create_remote_proxy(close: Event):
+def create_remote_proxy(close: Event, client_socket: ssl.SSLSocket, local_port: int):
+
     # 1. create relay connection on remote server
-    print("[*] requesting relay for service hosted on port " + str(LOCAL_PORT))
-    client_connection_ssl.sendall(json.dumps({
+    logger.info("requesting relay for service hosted on port " + str(local_port))
+    client_socket.sendall(json.dumps({
         "type": "control",
         "event": "create_relay"
     }).encode('utf8'))
 
-    data = client_connection_ssl.recv(4096)
+    data = client_socket.recv(4096)
+
     # switch to non-blocking
-    client_connection_ssl.setblocking(False)
+    client_socket.setblocking(False)
 
     sendq = bytes()
     recvq = bytes()
 
     result, data = grab_json(data)
     remote_port = result['port']
-    print("[*] created relay on remote port: ", remote_port)
+    logger.info(f"created relay on remote port: {remote_port}")
     # create local binding
     to_remote_proxy: Queue[tuple[RelayMessageTypes, str, int, bytes, int]]  = Queue()
     from_remote_proxy: Queue[tuple[RelayMessageTypes, str, int, bytes, int]]  = Queue()
 
-    local_proxy_th = Thread(target=create_local_proxy, args=(LOCAL_PORT, remote_port, close, from_remote_proxy, to_remote_proxy,))
+    local_proxy_th = Thread(target=create_local_proxy, args=(local_port, remote_port, close, from_remote_proxy, to_remote_proxy,))
     local_proxy_th.start()
 
     # switch to using selector
@@ -253,7 +253,7 @@ def create_remote_proxy(close: Event):
             decoded_data = b64decode(msg["data"])
             from_remote_proxy.put((RelayMessageTypes.MESSAGE, msg["address"], msg["port"], decoded_data, msg["relay_port"]))
         return
-    selector.register(client_connection_ssl, EVENT_READ | EVENT_WRITE, handle_relay)
+    selector.register(client_socket, EVENT_READ | EVENT_WRITE, handle_relay)
 
     failed_decodes = 0
     while not close.is_set():
@@ -268,8 +268,8 @@ def create_remote_proxy(close: Event):
                 failed_decodes = 0
             except:
                 failed_decodes += 1
-                if failed_decodes > 3:
-                    print("too many failed json decodes, something went wrong.  exiting...")
+                if failed_decodes > 30:
+                    logger.info("too many failed json decodes, something went wrong.  exiting...")
                     close.set()
                 break
 
@@ -304,11 +304,71 @@ def create_remote_proxy(close: Event):
     local_proxy_th.join()
 
 
-r_proxy_thread = Thread(target=create_remote_proxy, args=(close_service,))
-r_proxy_thread.start()
+def start_client(relay_host: str, relay_port: int, local_port: int):
+    # setup TLS
+    context = ssl.create_default_context()
+    context.load_verify_locations("cert.pem")
 
-while not close_service.is_set():
-    sched_yield()
+    # connection to relay server
+    client_connection = socket(AddressFamily.AF_INET, SocketKind.SOCK_STREAM)
+    client_connection.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
+    client_connection.setsockopt(SOL_SOCKET, SO_KEEPALIVE, 1)
+
+    client_connection_ssl = context.wrap_socket(client_connection, server_hostname="localhost")
+    try:
+        client_connection_ssl.connect((relay_host, relay_port))
+    except ConnectionRefusedError:
+        logger.error(f"could not connect to relay server at {relay_host}:{relay_port}")
+        exit(3)
+    
+    r_proxy_thread = Thread(target=create_remote_proxy, args=(close_service,client_connection_ssl,local_port,))
+    r_proxy_thread.start()
+    while not close_service.is_set():
+        sched_yield()
 
 
-print("[*] running client service")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Run PortPort client"
+    )
+
+    parser.add_argument(
+        "--relay-host", 
+        default=REMOTE_MGMT_SERVICE, 
+        help="external relay server hostname"
+    )
+
+    parser.add_argument(
+        "--relay-port",
+        type=int,
+        default=REMOTE_MGMT_SERVICE_PORT,
+        help="external relay management port"
+    )
+
+    parser.add_argument(
+        "--local-port",
+        type=int,
+        required=True,
+        help="local service port to expose"
+    )
+
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="verbose logging"
+    )
+
+    args = parser.parse_args()
+    # configure logger
+    configure_logger(args.verbose)
+
+    # spin up client
+    start_client(args.relay_host, args.relay_port, args.local_port)
+    
+    
+
+
+if __name__ == "__main__":
+    main()

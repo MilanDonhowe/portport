@@ -1,0 +1,7 @@
+[project]
+name = "portport"
+version = "0.1.0"
+
+[project.scripts]
+portport-client = "client:main"
+portport-server = "portport:main"
