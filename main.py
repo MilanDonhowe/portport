@@ -3,8 +3,8 @@ from logging import getLogger
 from queue import Queue, Empty
 import socket
 import signal
-import sys
-import time
+import ssl
+from ssl import SSLWantReadError, SSLWantWriteError
 import json
 import threading
 from os import sched_yield
@@ -13,11 +13,20 @@ from server.relay import Relay
 from typing import Dict
 from base64 import b64decode, b64encode
 from selectors import DefaultSelector, EVENT_WRITE, EVENT_READ
+from server.crypto import generate_ssc
+from pathlib import Path
 
 RELAY_MGMT_PORT = 1600 
 
 logger = getLogger("portport")
 
+if not Path("key.pem").is_file() or not Path("cert.pem").is_file():
+    generate_ssc()
+
+# SSL context
+context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+context.load_cert_chain(certfile="cert.pem", keyfile="key.pem", password=b"portport")
+#context.load_verify_locations("cert.pem")
 
 main_server = socket.socket(socket.AddressFamily.AF_INET, socket.SocketKind.SOCK_STREAM)
 main_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -55,15 +64,8 @@ signal.signal(signal.SIGTERM, ctrl_c_handler)
 # {"type": "control", "event": "open_relay", "port": <int>}
 # {"type": "data", "address": "152.123.543.12", "port": 1244, "data": "base64", "relay_port": 50011}
 
-def relayMgmt(s: socket.socket, close_service: threading.Event):
+def relayMgmt(s: ssl.SSLSocket, close_service: threading.Event):
     """thread to handle relay mgmt"""
-    # TODO: do like an auth handshake or something with openssl
-
-    #relays = []
-    # from external (foreign host)
-	#inbound = Queue()
-    # to the client socket (s.sendall)
-    
     close_thread = threading.Event()
     close_thread.clear()
 
@@ -74,7 +76,7 @@ def relayMgmt(s: socket.socket, close_service: threading.Event):
     sendq: bytes = bytes()
     recvq = bytes()
 
-    def handle_relay_client(s: socket.socket, mask: int):
+    def handle_relay_client(s: ssl.SSLSocket, mask: int):
         nonlocal sendq, recvq
         if mask & EVENT_WRITE and len(sendq) > 0:
             sent_len = s.send(sendq)
@@ -88,7 +90,7 @@ def relayMgmt(s: socket.socket, close_service: threading.Event):
                 recvq += data
             except (ConnectionResetError, BrokenPipeError):
                 close_thread.set()
-            except BlockingIOError:
+            except (BlockingIOError, SSLWantWriteError, SSLWantReadError):
                 pass
         #print(f"sendq size: {len(sendq)}, recvq size: {len(recvq)}")
 
@@ -250,8 +252,10 @@ connection_table: dict[tuple[str, int], threading.Thread] = {}
 def add_to_conn_table(listening_socket: socket.socket, mask: int):
     if mask & EVENT_READ:
         inbound_socket, addr = listening_socket.accept()
-        inbound_socket.setblocking(False)
-        connection_table[addr]= threading.Thread(target=relayMgmt, args=(inbound_socket, service_close_event,))
+        # apply SSL
+        inbound_ssl_socket = context.wrap_socket(inbound_socket, server_side=True, do_handshake_on_connect=True)
+        inbound_ssl_socket.setblocking(False)
+        connection_table[addr]= threading.Thread(target=relayMgmt, args=(inbound_ssl_socket, service_close_event,))
         connection_table[addr].start()
     return
 

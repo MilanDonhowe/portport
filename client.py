@@ -9,13 +9,13 @@
 #
 #
 # long term goal would be:
-# relay_client --relay <ip> --port 4000
+# relay_client --relay <ip> --port 4000 --cert <cert.pem>
 # 
 # 
 #===================================================================================================
-from socket import *
+from socket import socket, SOL_SOCKET, SO_KEEPALIVE, AddressFamily, SocketKind, SO_REUSEADDR
 from threading import Thread, Event
-from server.relay import Relay, RelayMessageTypes
+from server.relay import RelayMessageTypes
 from queue import Queue, Empty
 import signal, sys
 from types import FrameType
@@ -25,6 +25,7 @@ from base64 import b64encode, b64decode
 from os import sched_yield
 from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
 from typing import List
+import ssl
 
 proxy_threads = {}
 
@@ -91,8 +92,8 @@ def create_local_proxy(local_port: int, remote_port: int, close_event: Event, to
                         connections[(addr,port)].conn.setblocking(False)
                     except ConnectionRefusedError:
                         to_proxy.put((RelayMessageTypes.CLOSE_CONNECTION, addr, port, b'', remote_port))
-                        connections[(addr,port)].conn.close() # ensure socket got cleaned up
                         selector.unregister(connections[(addr,port)].conn)
+                        connections[(addr,port)].conn.close() # ensure socket got cleaned up
                         del connections[(addr,port)] # remove from dict
                         continue
                 elif msg_type == RelayMessageTypes.MESSAGE:
@@ -145,11 +146,17 @@ LOCAL_PORT = 1234
 REMOTE_MGMT_SERVICE = "0.0.0.0"
 REMOTE_MGMT_SERVICE_PORT = 1600
 
+# setup TLS
+context = ssl.create_default_context()
+context.load_verify_locations("cert.pem")
+
 # connection to relay server
 client_connection = socket(AddressFamily.AF_INET, SocketKind.SOCK_STREAM)
 client_connection.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
 client_connection.setsockopt(SOL_SOCKET, SO_KEEPALIVE, 1)
-client_connection.connect(('0.0.0.0', REMOTE_MGMT_SERVICE_PORT))
+
+client_connection_ssl = context.wrap_socket(client_connection, server_hostname="localhost")
+client_connection_ssl.connect(('0.0.0.0', REMOTE_MGMT_SERVICE_PORT))
 
 close_service = Event()
 close_service.clear()
@@ -175,14 +182,14 @@ signal.signal(signal.SIGTERM, ctrl_c_handler)
 def create_remote_proxy(close: Event):
     # 1. create relay connection on remote server
     print("[*] requesting relay for service hosted on port " + str(LOCAL_PORT))
-    client_connection.sendall(json.dumps({
+    client_connection_ssl.sendall(json.dumps({
         "type": "control",
         "event": "create_relay"
     }).encode('utf8'))
 
-    data = client_connection.recv(4096)
+    data = client_connection_ssl.recv(4096)
     # switch to non-blocking
-    client_connection.setblocking(False)
+    client_connection_ssl.setblocking(False)
 
     sendq = bytes()
     recvq = bytes()
@@ -201,7 +208,7 @@ def create_remote_proxy(close: Event):
     selector = DefaultSelector()
 
 
-    def handle_relay(conn: socket, mask: int):
+    def handle_relay(conn: ssl.SSLSocket, mask: int):
         nonlocal sendq, recvq
         if (mask & EVENT_WRITE) and len(sendq) > 0:
             try:
@@ -211,8 +218,9 @@ def create_remote_proxy(close: Event):
                 conn.close()
                 selector.unregister(conn)
                 close.set()
+                return
                 # Do I need to add a msg to the queue? probably  
-            except BlockingIOError:
+            except (BlockingIOError, ssl.SSLWantWriteError, ssl.SSLWantReadError):
                 pass     
         if mask & EVENT_READ:
             try:
@@ -227,7 +235,7 @@ def create_remote_proxy(close: Event):
                 conn.close()
                 close.set()
                 selector.unregister(conn)
-            except BlockingIOError:
+            except (BlockingIOError, ssl.SSLWantReadError, ssl.SSLWantWriteError):
                 pass
         return
 
@@ -245,7 +253,7 @@ def create_remote_proxy(close: Event):
             decoded_data = b64decode(msg["data"])
             from_remote_proxy.put((RelayMessageTypes.MESSAGE, msg["address"], msg["port"], decoded_data, msg["relay_port"]))
         return
-    selector.register(client_connection, EVENT_READ | EVENT_WRITE, handle_relay)
+    selector.register(client_connection_ssl, EVENT_READ | EVENT_WRITE, handle_relay)
 
     failed_decodes = 0
     while not close.is_set():

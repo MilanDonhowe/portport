@@ -56,6 +56,8 @@ class Relay():
         del self.connection_queues[addr]
         del self.connection_table[addr]
         self.selector.unregister(sock)
+        # ensure we closed socket
+        sock.close()
 
     def handle_socket(self, sock: socket.socket, mask: int):
         """i/o on external socket connection to our relay"""
@@ -69,6 +71,7 @@ class Relay():
             except (BrokenPipeError, ConnectionResetError):
                 # blocking IO shouldn't happen afaik
                 self.clean_up_connection(sock, addr)
+                return # don't continue to EVENT_READ handling
             except BlockingIOError:
                 # this normally shouldn't happen but if it does let's keep chugging along
                 pass
@@ -113,7 +116,6 @@ class Relay():
                         if msg == RelayMessageTypes.MESSAGE:
                              self.connection_queues[(address, port)] += data
                         elif msg == RelayMessageTypes.CLOSE_CONNECTION:
-                            con.close()
                             self.clean_up_connection(con, (address, port))
                         else:
                             # SHOULD RAISE ERROR
@@ -122,6 +124,8 @@ class Relay():
                             
                     except BlockingIOError:
                         break
+            except KeyError:
+                print("unknown connection referenced, ignoring...")
             except Exception as e:
                 print("UNKNOWN EXCEPTION HIT")
                 print(e)
@@ -140,5 +144,3 @@ class Relay():
         print("[*] relay connections cleaned up!")
         
 
-    def close(self):
-        pass
