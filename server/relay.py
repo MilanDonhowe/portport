@@ -6,7 +6,8 @@ from .common import RelayMessageTypes, is_socket_open
 from os import sched_yield
 import logging
 from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
-        
+from .metrics import ACTIVE_RELAYS, BYTES_TRANSFERRED, ACTIVE_CONNECTIONS
+
 RELAY_SERVER_LOGGER_NAME = "portport-server"
 
 class Relay():
@@ -40,6 +41,7 @@ class Relay():
         self._sck.bind((self.addr, self.port))
         self.identifying_port = self.get_port()
         self.logger.info(f"new relay initialized at port {self.identifying_port}")
+        ACTIVE_RELAYS.inc()
 
     def accept_inbound_connection(self, sock: socket.socket, mask: int):
         """accept new connection"""
@@ -49,6 +51,7 @@ class Relay():
         self.connection_queues[addr] = b''
         self.selector.register(conn, EVENT_READ | EVENT_WRITE, self.handle_socket)
         self.inbound.put((RelayMessageTypes.NEW_CONNECTION, addr[0], addr[1], b'', self.identifying_port))
+        ACTIVE_CONNECTIONS.inc()
 
     def clean_up_connection(self, sock: socket.socket, addr: tuple[str, int]):
         self.inbound.put((RelayMessageTypes.CLOSE_CONNECTION, addr[0], addr[1], b'', self.identifying_port))
@@ -57,6 +60,7 @@ class Relay():
         self.selector.unregister(sock)
         # ensure we closed socket
         sock.close()
+        ACTIVE_CONNECTIONS.dec()
 
     def handle_socket(self, sock: socket.socket, mask: int):
         """i/o on external socket connection to our relay"""
@@ -67,6 +71,7 @@ class Relay():
             try:
                 sent_length = sock.send(sendq)
                 self.connection_queues[addr] = sendq[sent_length:]
+                BYTES_TRANSFERRED.labels(direction="relay_to_external_host").inc(sent_length)
             except (BrokenPipeError, ConnectionResetError):
                 # blocking IO shouldn't happen afaik
                 self.clean_up_connection(sock, addr)
@@ -81,6 +86,7 @@ class Relay():
                 if len(data) == 0:
                     self.clean_up_connection(sock, addr)
                 else:
+                    BYTES_TRANSFERRED.labels(direction="external_host_to_relay").inc(len(data))
                     self.inbound.put((RelayMessageTypes.MESSAGE, addr[0], addr[1], data, self.identifying_port))
             except (ConnectionResetError, BrokenPipeError):
                 self.clean_up_connection(sock, addr)
@@ -134,11 +140,12 @@ class Relay():
 
         self.logger.info(f"closing relay port={self.identifying_port}, cleaning up existing connections")
         # clean up pending connections
-        for sock in self.connection_table.values():
-            # doesn't matter if we call ".close()" on a closed socket it should NOT raise an exception
-            sock.close()
+        copy = list(self.connection_table.items())
+        for addr, sock in copy:
+            self.clean_up_connection(sock, addr)
         self._sck.close()
         self.selector.close()
+        ACTIVE_RELAYS.dec()
         self.logger.info(f"cleaned up connections for relay port={self.identifying_port}.  Relay successfully closed!")
         
 

@@ -4,8 +4,6 @@ ngrok but slow (yet free!).
 
 DISCLAIMER: this is not well-tested, not performant, and shouldn't be used in 99.9999% of the time.
 
-Also, be careful exposing local services on your host to the internet; you will get hacked if you blindly expose vulnerable software.  Only use this if you know what you're doing. 
-
 ### Use case:
 
 You want to host some service from your local machine (i.e., maybe a minecraft server), but your network firewall doesn't allow for inbound traffic (i.e., the internet) to access your local machine (i.e., there's no port-forwarding on your network) and for whatever reason, you lack control over your network router settings or don't desire modifying them.
@@ -28,7 +26,5 @@ And now external hosts can access your local TCP server via your VPS IP (the por
 - [ ] fix bad select() that probably is busy polling
 - [ ] make ssl support not crude
 - [ ] reduce head-of-line blocking by including multiple TCP connections between server and client
-- [ ] built-in telemetry
 - [ ] better readme guide
-- [ ] better internal message encoding between relay server and relay client (I'm using JSON right now because I am lazy)
 

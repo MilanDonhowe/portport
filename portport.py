@@ -7,6 +7,7 @@
 
 
 from server.common import *
+from server.metrics import MGMT_CONNECTIONS, BYTES_TRANSFERRED, MESSAGE_PROCESSING_SECONDS
 from logging import getLogger
 from queue import Queue, Empty
 import socket
@@ -21,6 +22,7 @@ from typing import Dict
 from selectors import DefaultSelector, EVENT_WRITE, EVENT_READ
 from server.crypto import generate_ssc
 from pathlib import Path
+from prometheus_client import start_http_server
 import argparse
 
 RELAY_MGMT_PORT = 1600 
@@ -137,25 +139,37 @@ def main() -> None:
         help="verbose logging"
     )
 
+    parser.add_argument(
+        "--metrics-port",
+        default=9100,
+        type=int,
+        help="Prometheus metrics HTTP port; set to 0 to disable",
+    )
+
     args = parser.parse_args()
 
     # configure logger
     configure_logger(args.verbose)
 
+
+    if args.metrics_port != 0:
+        start_http_server(
+            port=args.metrics_port,
+            addr='0.0.0.0'
+        )
+        logger.info(f"Prometheus metrics server running on port {args.metrics_port}")
+
+
     # spin up server
     start_relay_mgmt_server(args.port, args.key, args.cert, args.passphrase)
 
 
-
-
-
-# {"type": "control", "event": "create_relay"}
-# {"type": "control", "event": "close_relay", "port": 44}
-# {"type": "control", "event": "open_relay", "port": <int>}
-# {"type": "data", "address": "152.123.543.12", "port": 1244, "data": "base64", "relay_port": 50011}
-
 def relayMgmt(s: ssl.SSLSocket, close_service: threading.Event):
     """thread to handle relay mgmt"""
+
+    # metrics
+    MGMT_CONNECTIONS.inc()
+
     close_thread = threading.Event()
     close_thread.clear()
 
@@ -171,11 +185,15 @@ def relayMgmt(s: ssl.SSLSocket, close_service: threading.Event):
         if mask & EVENT_WRITE and len(sendq) > 0:
             sent_len = s.send(sendq)
             sendq = sendq[sent_len:]
+            # telemetry
+            BYTES_TRANSFERRED.labels(direction="relay_to_client").inc(sent_len)
         if mask & EVENT_READ:
             try:
                 data = s.recv(4096)
                 if len(data) == 0:
                     close_thread.set()
+                # telemetry
+                BYTES_TRANSFERRED.labels(direction="client_to_relay").inc(len(data))
                 # put onto processing queue
                 recvq += data
             except (ConnectionResetError, BrokenPipeError):
@@ -187,42 +205,43 @@ def relayMgmt(s: ssl.SSLSocket, close_service: threading.Event):
 
 
     def process_msg(msg: PortPortMessage):
-        nonlocal sendq
-        if msg.msg_type == PortPortMessageType.CREATE_RELAY:
-            # spawn new relay
-            new_relay = Relay(close_service, inbound_data, Queue())
-            # create thread
-            new_relay_thread = threading.Thread(target=new_relay.open)
-            relays[new_relay.get_port()] = (new_relay, new_relay_thread)
-            # kick off relay thread (spawn thread)                                
-            new_relay_thread.start()
+        with MESSAGE_PROCESSING_SECONDS.labels(type=msg.msg_type.name).time():
+            nonlocal sendq
+            if msg.msg_type == PortPortMessageType.CREATE_RELAY:
+                # spawn new relay
+                new_relay = Relay(close_service, inbound_data, Queue())
+                # create thread
+                new_relay_thread = threading.Thread(target=new_relay.open)
+                relays[new_relay.get_port()] = (new_relay, new_relay_thread)
+                # kick off relay thread (spawn thread)                                
+                new_relay_thread.start()
 
-            # notify client of new relay
-            sendq += PortPortMessage(msg_type=PortPortMessageType.OPEN_RELAY, relay_port=new_relay.get_port()).serialize()
-        # if local service closes connection
-        elif msg.msg_type == PortPortMessageType.CLOSE_CONNECTION:
-            relay, relay_t = relays[msg.relay_port]
-            relay.outbound.put((RelayMessageTypes.CLOSE_CONNECTION, str(msg.addr), msg.port, b'', msg.relay_port))
-        elif msg.msg_type == PortPortMessageType.DESTROY_RELAY:
-            if msg.relay_port in relays:
+                # notify client of new relay
+                sendq += PortPortMessage(msg_type=PortPortMessageType.OPEN_RELAY, relay_port=new_relay.get_port()).serialize()
+            # if local service closes connection
+            elif msg.msg_type == PortPortMessageType.CLOSE_CONNECTION:
                 relay, relay_t = relays[msg.relay_port]
-                # signal close
-                relay.atomic_close.set()
-                # close thread (might have blocking issues here)
-                relay_t.join()
-                # remove from relay table
-                del relays[msg.relay_port]
-                # successful result
-                sendq += PortPortMessage(msg_type=PortPortMessageType.DESTROY_RELAY, relay_port=msg.relay_port).serialize()
-        elif msg.msg_type == PortPortMessageType.DATA:
-            # this data goes to foreign/external host
-            if msg.relay_port not in relays:
-                sendq += PortPortMessage(msg_type=PortPortMessageType.ERROR, err=PortPortErrorTypes.RELAY_DOES_NOT_EXIST).serialize()
-            else:
-                # data from client to foreign connection
-                relay = relays[msg.relay_port][0]
-                # identifying port is a bit redundant here but including it for uniformity between inbound/outbound queues
-                relay.outbound.put((RelayMessageTypes.MESSAGE, str(msg.addr), msg.port, msg.data, msg.relay_port))
+                relay.outbound.put((RelayMessageTypes.CLOSE_CONNECTION, str(msg.addr), msg.port, b'', msg.relay_port))
+            elif msg.msg_type == PortPortMessageType.DESTROY_RELAY:
+                if msg.relay_port in relays:
+                    relay, relay_t = relays[msg.relay_port]
+                    # signal close
+                    relay.atomic_close.set()
+                    # close thread (might have blocking issues here)
+                    relay_t.join()
+                    # remove from relay table
+                    del relays[msg.relay_port]
+                    # successful result
+                    sendq += PortPortMessage(msg_type=PortPortMessageType.DESTROY_RELAY, relay_port=msg.relay_port).serialize()
+            elif msg.msg_type == PortPortMessageType.DATA:
+                # this data goes to foreign/external host
+                if msg.relay_port not in relays:
+                    sendq += PortPortMessage(msg_type=PortPortMessageType.ERROR, err=PortPortErrorTypes.RELAY_DOES_NOT_EXIST).serialize()
+                else:
+                    # data from client to foreign connection
+                    relay = relays[msg.relay_port][0]
+                    # identifying port is a bit redundant here but including it for uniformity between inbound/outbound queues
+                    relay.outbound.put((RelayMessageTypes.MESSAGE, str(msg.addr), msg.port, msg.data, msg.relay_port))
 
  
 
@@ -303,6 +322,7 @@ def relayMgmt(s: ssl.SSLSocket, close_service: threading.Event):
     selector.close()
     s.close()
     logger.info("relay sockets closed, done")
+    MGMT_CONNECTIONS.dec()
     
 
 
