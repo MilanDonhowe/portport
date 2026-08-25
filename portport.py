@@ -1,3 +1,11 @@
+#===================================================================================================
+# portport.py reverse proxy server
+#
+# 
+#
+#===================================================================================================
+
+
 from server.common import *
 from logging import getLogger
 from queue import Queue, Empty
@@ -5,13 +13,11 @@ import socket
 import signal
 import ssl
 from ssl import SSLWantReadError, SSLWantWriteError
-import json
 import threading
 from os import sched_yield
 from types import FrameType
 from server.relay import Relay, RELAY_SERVER_LOGGER_NAME
 from typing import Dict
-from base64 import b64decode, b64encode
 from selectors import DefaultSelector, EVENT_WRITE, EVENT_READ
 from server.crypto import generate_ssc
 from pathlib import Path
@@ -180,72 +186,44 @@ def relayMgmt(s: ssl.SSLSocket, close_service: threading.Event):
 
 
 
-    def process_msg(msg: dict):
+    def process_msg(msg: PortPortMessage):
         nonlocal sendq
-        # TODO VALIDATE JSON
-        if not valid_msg(msg):
-            raise EncodingWarning("invalid json msg received")
-        
-        if msg["type"] == 'control':
-            # check control type
-            if msg["event"] == 'create_relay':
-                # spawn new relay
-                new_relay = Relay(close_service, inbound_data, Queue())
-                # create thread
-                new_relay_thread = threading.Thread(target=new_relay.open)
-                relays[new_relay.get_port()] = (new_relay, new_relay_thread)
-                # kick off relay thread (spawn thread)                                
-                new_relay_thread.start()
-                # notify client
-                sendq += json.dumps({
-                    "type": "control",
-                    "event": "open_relay",
-                    "port": new_relay.get_port()
-                }).encode('utf8')
-                # if local service closes connection
-            elif msg["event"] == "close_connection":
-                relay, relay_t = relays[msg['relay_port']]
-                # TODO: validation better
-                relay.outbound.put((RelayMessageTypes.CLOSE_CONNECTION, msg["address"], msg["port"], b'', msg["relay_port"])) # type: ignore
-            elif msg["event"] == 'close_relay':
-                if "port" in msg:
-                    port = msg["port"]
-                    if port in relays:
-                        relay, relay_t = relays[port]
-                        # signal close
-                        relay.atomic_close.set()
-                        # close thread (might have blocking issues here)
-                        relay_t.join()
-                        # remove from relay table
-                        del relays[port]
-                        # successful result
-                        sendq += json.dumps({"type":"control", "event":"relay_closed","port": port}).encode('utf8')
-                    else:
-                        sendq += MISSING_RELAY_JSON_ERROR
-                else:
-                    sendq += MISSING_PORT_JSON_ERROR
+        if msg.msg_type == PortPortMessageType.CREATE_RELAY:
+            # spawn new relay
+            new_relay = Relay(close_service, inbound_data, Queue())
+            # create thread
+            new_relay_thread = threading.Thread(target=new_relay.open)
+            relays[new_relay.get_port()] = (new_relay, new_relay_thread)
+            # kick off relay thread (spawn thread)                                
+            new_relay_thread.start()
+
+            # notify client of new relay
+            sendq += PortPortMessage(msg_type=PortPortMessageType.OPEN_RELAY, relay_port=new_relay.get_port()).serialize()
+        # if local service closes connection
+        elif msg.msg_type == PortPortMessageType.CLOSE_CONNECTION:
+            relay, relay_t = relays[msg.relay_port]
+            relay.outbound.put((RelayMessageTypes.CLOSE_CONNECTION, str(msg.addr), msg.port, b'', msg.relay_port))
+        elif msg.msg_type == PortPortMessageType.DESTROY_RELAY:
+            if msg.relay_port in relays:
+                relay, relay_t = relays[msg.relay_port]
+                # signal close
+                relay.atomic_close.set()
+                # close thread (might have blocking issues here)
+                relay_t.join()
+                # remove from relay table
+                del relays[msg.relay_port]
+                # successful result
+                sendq += PortPortMessage(msg_type=PortPortMessageType.DESTROY_RELAY, relay_port=msg.relay_port).serialize()
+        elif msg.msg_type == PortPortMessageType.DATA:
+            # this data goes to foreign/external host
+            if msg.relay_port not in relays:
+                sendq += PortPortMessage(msg_type=PortPortMessageType.ERROR, err=PortPortErrorTypes.RELAY_DOES_NOT_EXIST).serialize()
             else:
-                sendq += UNKNOWN_EVENT_JSON_ERROR
-        elif msg["type"] == 'data':
-            if 'address' not in msg or 'port' not in msg or 'relay_port' not in msg:
-                sendq += MISSING_ADDRESS_FIELDS
-            elif "data" in msg:
-                try:
-                    data = b64decode(msg['data']) # type: ignore
-                    # this data goes to foreign host
-                    if msg['relay_port'] not in relays:
-                        sendq += MISSING_RELAY_JSON_ERROR
-                    else:
-                        # data from client to foreign connection
-                        relay = relays[msg['relay_port']][0]
-                        # identifying port is a bit redundant here but including it for uniformity between inbound/outbound queues
-                        relay.outbound.put((RelayMessageTypes.MESSAGE, msg['address'], msg['port'], data, msg['relay_port'])) # type: ignore
-                except:
-                    sendq += DECODING_ERROR
-            else:
-                sendq += MISSING_DATA_FIELD
-        else:
-            sendq += BAD_TYPE_JSON_ERROR
+                # data from client to foreign connection
+                relay = relays[msg.relay_port][0]
+                # identifying port is a bit redundant here but including it for uniformity between inbound/outbound queues
+                relay.outbound.put((RelayMessageTypes.MESSAGE, str(msg.addr), msg.port, msg.data, msg.relay_port))
+
  
 
 
@@ -266,14 +244,12 @@ def relayMgmt(s: ssl.SSLSocket, close_service: threading.Event):
         # handle recv queue
         while len(recvq)>0:
             try:
-                json_obj, recvq = grab_json(recvq)
-                process_msg(json_obj)
+                msg, recvq = grab_msg(recvq)
+                process_msg(msg)
                 failed_decode = 0
+            # TODO: should probably have more intelligent error handling here
             except:
                 failed_decode+=1
-                #if failed_decode > 100:
-                #    logger.error("too many consecutive json decodes, killing relay mgmt thread")
-                #    close_thread.set()
                 break
         
         # handle sendq (messages from our relays to client relay mgmt connection)
@@ -284,30 +260,28 @@ def relayMgmt(s: ssl.SSLSocket, close_service: threading.Event):
             for _ in range(BOUNDED_BATCH):
                 msg_type, con_addr, con_port, data, relay_port = inbound_data.get_nowait()
                 if msg_type == RelayMessageTypes.MESSAGE:
-                    sendq += json.dumps({
-                        "type":"data",
-                        "address": con_addr,
-                        "port": con_port,
-                        "relay_port": relay_port,
-                        "data": b64encode(data).decode('utf8')
-                    }).encode("utf8")
+                    sendq += PortPortMessage(
+                        msg_type=PortPortMessageType.DATA, 
+                        conn_addr=con_addr, 
+                        conn_port=con_port,
+                        relay_port=relay_port,
+                        data=data
+                    ).serialize()
                 # notify new connection
                 elif msg_type == RelayMessageTypes.NEW_CONNECTION:
-                    sendq += json.dumps({
-                        "type": "control",
-                        "event": "new_connection",
-                        "address": con_addr,
-                        "port": con_port,
-                        "relay_port": relay_port
-                    }).encode('utf8')
+                    sendq += PortPortMessage(
+                        msg_type=PortPortMessageType.NEW_CONNECTION,
+                        conn_addr=con_addr,
+                        conn_port=con_port,
+                        relay_port=relay_port
+                    ).serialize()
                 elif msg_type == RelayMessageTypes.CLOSE_CONNECTION:
-                    sendq += json.dumps({
-                        "type": "control",
-                        "event": "close_connection",
-                        "address": con_addr,
-                        "port": con_port,
-                        "relay_port": relay_port
-                    }).encode('utf8')
+                    sendq += PortPortMessage(
+                        msg_type=PortPortMessageType.CLOSE_CONNECTION,
+                        conn_addr=con_addr,
+                        conn_port=con_port,
+                        relay_port=relay_port
+                    ).serialize()
                 else:
                     # really, we should probably raise some sort of exception here since this code path implies some unaccounted for inbound message
                     # from a proxied host payload intended for our client but for now I'm going to ignore it :)

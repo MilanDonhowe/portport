@@ -1,15 +1,15 @@
 #===================================================================================================
 #
-# Relay Service!
+# Relay Client Script
+#
 # Ok, so this should work as the relay client that runs on the host system that needs this relay service.
 # 
 # The main idea here is we dynamically create a reverse-proxy with our relay service by initializing a TCP connection
 # from this client program and spin up as many relay endpoints (proxies) as we want and redirect their TCP traffic to
-# services running on the host.  We'll test with a basic ncat example first
+# services running on the host.
 #
 #
-# long term goal would be:
-# relay_client --relay <ip> --port 4000 --cert <cert.pem>
+# python client.py --relay-host <ip> --relay-port 4000 --local-port 1234 --cert <cert.pem> --key <key.pem>
 # 
 # 
 #===================================================================================================
@@ -19,9 +19,7 @@ from server.relay import RelayMessageTypes
 from queue import Queue, Empty
 import signal, sys
 from types import FrameType
-import json
-from server.common import grab_json, is_socket_open, configure_logger
-from base64 import b64encode, b64decode
+from server.common import grab_msg, is_socket_open, configure_logger, PortPortMessageType, PortPortMessage
 from os import sched_yield
 from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
 from typing import List
@@ -181,11 +179,8 @@ def create_remote_proxy(close: Event, client_socket: ssl.SSLSocket, local_port: 
 
     # 1. create relay connection on remote server
     logger.info("requesting relay for service hosted on port " + str(local_port))
-    client_socket.sendall(json.dumps({
-        "type": "control",
-        "event": "create_relay"
-    }).encode('utf8'))
-
+    
+    client_socket.sendall(PortPortMessage(PortPortMessageType.CREATE_RELAY).serialize())
     data = client_socket.recv(4096)
 
     # switch to non-blocking
@@ -194,8 +189,9 @@ def create_remote_proxy(close: Event, client_socket: ssl.SSLSocket, local_port: 
     sendq = bytes()
     recvq = bytes()
 
-    result, data = grab_json(data)
-    remote_port = result['port']
+    result, data = grab_msg(data)
+    remote_port = result.relay_port
+
     logger.info(f"created relay on remote port: {remote_port}")
     # create local binding
     to_remote_proxy: Queue[tuple[RelayMessageTypes, str, int, bytes, int]]  = Queue()
@@ -239,19 +235,15 @@ def create_remote_proxy(close: Event, client_socket: ssl.SSLSocket, local_port: 
                 pass
         return
 
-    def process_msg(msg: dict) -> None: # type: ignore
-        # TODO: Validate msg
-        if msg["type"] == "control":
-            if msg["event"] == "new_connection":
-                from_remote_proxy.put((RelayMessageTypes.NEW_CONNECTION, msg["address"], msg["port"], b'', msg["relay_port"]))
-            elif msg["event"] == "close_connection":
-                from_remote_proxy.put((RelayMessageTypes.CLOSE_CONNECTION, msg["address"], msg["port"], b'', msg["relay_port"]))
-            else:
-                # error?
-                raise Exception("Unknown event")        
-        elif msg["type"] == "data":
-            decoded_data = b64decode(msg["data"])
-            from_remote_proxy.put((RelayMessageTypes.MESSAGE, msg["address"], msg["port"], decoded_data, msg["relay_port"]))
+    def process_msg(msg: PortPortMessage) -> None: # type: ignore
+        if msg.msg_type == PortPortMessageType.NEW_CONNECTION:
+            from_remote_proxy.put((RelayMessageTypes.NEW_CONNECTION, str(msg.addr), msg.port, b'', msg.relay_port))
+        elif msg.msg_type == PortPortMessageType.CLOSE_CONNECTION:
+            from_remote_proxy.put((RelayMessageTypes.CLOSE_CONNECTION, str(msg.addr), msg.port, b'', msg.relay_port))
+        elif msg.msg_type == PortPortMessageType.DATA:
+            from_remote_proxy.put((RelayMessageTypes.MESSAGE, str(msg.addr), msg.port, msg.data, msg.relay_port))
+        else:
+            logger.error(f"unsupported message type: \"{msg.msg_type}\"")
         return
     selector.register(client_socket, EVENT_READ | EVENT_WRITE, handle_relay)
 
@@ -263,11 +255,12 @@ def create_remote_proxy(close: Event, client_socket: ssl.SSLSocket, local_port: 
 
         while len(recvq) > 0:
             try:
-                json_obj, recvq = grab_json(recvq)
-                process_msg(json_obj)
+                msg, recvq = grab_msg(recvq)
+                process_msg(msg)
                 failed_decodes = 0
             except:
                 failed_decodes += 1
+                # TODO: remove this
                 if failed_decodes > 30:
                     logger.info("too many failed json decodes, something went wrong.  exiting...")
                     close.set()
@@ -280,21 +273,20 @@ def create_remote_proxy(close: Event, client_socket: ssl.SSLSocket, local_port: 
                 # check message queue 
                 msgType, addr, port, outbound_data, r_port = to_remote_proxy.get_nowait()
                 if msgType == RelayMessageTypes.CLOSE_CONNECTION:
-                    sendq += json.dumps({
-                        "type": "control",
-                        "event": "close_connection",
-                        "address": addr,
-                        "port": port,
-                        "relay_port": r_port
-                    }).encode("utf8")
+                    sendq += PortPortMessage(
+                        msg_type=PortPortMessageType.CLOSE_CONNECTION,
+                        conn_addr=addr,
+                        conn_port=port,
+                        relay_port=r_port
+                    ).serialize()
                 elif msgType == RelayMessageTypes.MESSAGE:
-                    sendq += json.dumps({
-                        "type":"data",
-                        "address": addr,
-                        "port": port,
-                        "relay_port": r_port,
-                        "data": b64encode(outbound_data).decode('utf8')
-                    }).encode("utf8")
+                    sendq += PortPortMessage(
+                        msg_type=PortPortMessageType.DATA,
+                        conn_addr=addr,
+                        conn_port=port,
+                        relay_port=r_port,
+                        data=outbound_data
+                    ).serialize()
                 else:
                     raise Exception("Unknown RelayMessageType!")
         except Empty:
