@@ -1,8 +1,7 @@
 import socket
-from queue import Queue, Empty
-from threading import Event, Timer
-from time import sleep
-from .common import RelayMessageTypes, is_socket_open
+from queue import Queue
+from threading import Event
+from .common import RelayMessageTypes
 from os import sched_yield
 import logging
 from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE

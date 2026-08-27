@@ -31,10 +31,13 @@ class PortPortMessageType(IntEnum):
     DATA = auto()
     OPEN_RELAY = auto()
     ERROR = auto()
+    AUTH = auto()
+    AUTH_SUCCESS = auto()
     
 class PortPortErrorTypes(IntEnum):
     NO_ERROR = auto()
     RELAY_DOES_NOT_EXIST = auto()
+    AUTH_FAILURE = auto()
 
 # message between PortPort client and server
 class PortPortMessage():
@@ -56,6 +59,7 @@ class PortPortMessage():
         self.port = conn_port
         self.relay_port = relay_port
         self.error = err
+        self.auth = ""
 
     def serialize(self):
         # header:
@@ -63,6 +67,8 @@ class PortPortMessage():
         msg_header = b'@' + struct.pack(">B", self.msg_type) + struct.pack(">B", self.version)
         if self.msg_type == PortPortMessageType.ERROR:
             return msg_header + struct.pack(">B", self.error)
+        if self.msg_type == PortPortMessageType.AUTH:
+            return msg_header + struct.pack(">H", len(self.auth)) + self.auth.encode('utf8')
         elif self.msg_type == PortPortMessageType.DATA:
             # ok, so serializing this will change if the address if IPv4 or IPv6
             if isinstance(self.addr, IPv6Address):
@@ -70,7 +76,7 @@ class PortPortMessage():
             else:
                 msg_header = msg_header + struct.pack(">B", 4) + inet_pton(AddressFamily.AF_INET, str(self.addr)) +  struct.pack(">H", self.port) + struct.pack(">H", self.relay_port)
             return msg_header + struct.pack(">I", len(self.data)) + self.data
-        elif self.msg_type == PortPortMessageType.CREATE_RELAY:
+        elif self.msg_type == PortPortMessageType.CREATE_RELAY or self.msg_type == PortPortMessageType.AUTH_SUCCESS:
             return msg_header
         elif self.msg_type == PortPortMessageType.OPEN_RELAY:
             return msg_header + struct.pack(">H", self.relay_port)
@@ -100,7 +106,13 @@ class PortPortMessage():
         if msg_type == PortPortMessageType.ERROR:
             msg_error = PortPortErrorTypes(data[3])
             return cls(msg_type=msg_type, version=msg_version, err=msg_error), data[4:]
-        elif msg_type == PortPortMessageType.CREATE_RELAY:
+        elif msg_type == PortPortMessageType.AUTH:
+            token_length = struct.unpack(">H", data[3:5])[0]
+            token = data[5:5+token_length]
+            auth_msg = cls(msg_type=msg_type, version=msg_version)
+            auth_msg.auth = token.decode('utf8')
+            return auth_msg, data[5+token_length:]
+        elif msg_type == PortPortMessageType.CREATE_RELAY or msg_type == PortPortMessageType.AUTH_SUCCESS:
             return cls(msg_type=msg_type, version=msg_version), data[3:]
         elif msg_type == PortPortMessageType.DESTROY_RELAY:
             relay_port = struct.unpack(">H", data[3:5])[0]
@@ -172,42 +184,6 @@ def grab_json(buffer: bytes) -> tuple[Any, bytes]:
         else:
             raise Exception("General JSON fail")
 
-
-GENERIC_JSON_ERROR = json.dumps({
-    "error": "bad json payload"
-}).encode('utf8')
-
-BAD_TYPE_JSON_ERROR = json.dumps({
-    "error": "unknown json message type"
-}).encode('utf8')
-
-BAD_EVENT_JSON_ERROR = json.dumps({
-    "error": "unknown json event type"
-}).encode('utf8')
-
-MISSING_PORT_JSON_ERROR = json.dumps({
-    "error": "json message missing \"port\" field"
-}).encode('utf8')
-
-MISSING_RELAY_JSON_ERROR = json.dumps({
-    "error": "no managed relay matching requested port number"
-}).encode('utf8')
-
-MISSING_ADDRESS_FIELDS = json.dumps({
-    "error": "missing address and/or port field in message"
-}).encode('utf8')
-
-MISSING_DATA_FIELD = json.dumps({
-    "error": "missing data field for data type message"
-}).encode('utf8')
-
-DECODING_ERROR = json.dumps({
-    "error": "failed to base64 decode data payload"
-}).encode('utf8')
-
-UNKNOWN_EVENT_JSON_ERROR = json.dumps({
-    "error": "unknown event for given message type"
-}).encode('utf8')
 
 def is_socket_open(s:socket) -> bool:
     """

@@ -1,11 +1,9 @@
 #===================================================================================================
 # portport.py reverse proxy server
-#
+# 
 # 
 #
 #===================================================================================================
-
-
 from server.common import *
 from server.metrics import MGMT_CONNECTIONS, BYTES_TRANSFERRED, MESSAGE_PROCESSING_SECONDS
 from logging import getLogger
@@ -23,10 +21,12 @@ from selectors import DefaultSelector, EVENT_WRITE, EVENT_READ
 from server.crypto import generate_ssc
 from pathlib import Path
 from prometheus_client import start_http_server
+from uuid import uuid4
 import argparse
 
 RELAY_MGMT_PORT = 1600 
 RELAY_MGMT_ADDR = "0.0.0.0"
+
 logger = getLogger(RELAY_SERVER_LOGGER_NAME)
 
 
@@ -47,13 +47,11 @@ def ctrl_c_handler(signum: int, frame: FrameType | None):
 signal.signal(signal.SIGINT, ctrl_c_handler)
 signal.signal(signal.SIGTERM, ctrl_c_handler)
 
-
-
 if not Path("key.pem").is_file() or not Path("cert.pem").is_file():
     generate_ssc()
 
 
-def start_relay_mgmt_server(port: int, key_file: str, cert_file: str, passphrase: str):
+def start_relay_mgmt_server(port: int, key_file: str, cert_file: str, passphrase: str, auth_token: str, auth_bypass: bool = False):
 
     # SSL context
     context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
@@ -70,8 +68,12 @@ def start_relay_mgmt_server(port: int, key_file: str, cert_file: str, passphrase
     # TODO: make back log configurable
     main_server.listen(5)
 
-    logger.info("spun up relay server on port " + str(port))
-
+    if auth_bypass == True:
+        logger.warning("warning: auth disabled! anyone can now control the relay server!")
+        logger.info(f"spun up relay server on port {port}")
+    else:
+        logger.info(f"spun up relay server on port {port} with auth token \"{auth_token}\"")
+    
 
     connection_table: dict[tuple[str, int], threading.Thread] = {}
     def add_to_conn_table(listening_socket: socket.socket, mask: int):
@@ -79,6 +81,33 @@ def start_relay_mgmt_server(port: int, key_file: str, cert_file: str, passphrase
             inbound_socket, addr = listening_socket.accept()
             # apply SSL
             inbound_ssl_socket = context.wrap_socket(inbound_socket, server_side=True, do_handshake_on_connect=True)
+            inbound_ssl_socket.settimeout(2.0) # it should be sent very quickly
+            # While blocking ensure we get the Auth message
+            try:
+                if auth_bypass == False:
+                    # the auth packet is small enough it shouldn't get fragmented over TCP/IP
+                    auth_msg = inbound_ssl_socket.recv(4096)
+                    # this should de-serialize correctly
+                    auth_msg, _data = PortPortMessage.deserialize(auth_msg)
+                    if auth_msg.msg_type != PortPortMessageType.AUTH:
+                        logger.debug("initial message was not auth! killing client")
+                        raise ConnectionError('Initial message with client not auth message')
+                    if auth_msg.auth != auth_token:
+                        # sendall() is typically bad since it blocks but again, this is a 3 byte write.  Should be over quickly
+                        inbound_ssl_socket.sendall(PortPortMessage(PortPortMessageType.ERROR, err=PortPortErrorTypes.AUTH_FAILURE).serialize())
+                        logger.debug("refused connection for invalid auth token")
+                        raise Exception("Invalid auth token")
+                    # else, success!
+                    inbound_ssl_socket.sendall(PortPortMessage(PortPortMessageType.AUTH_SUCCESS).serialize())
+                    logger.debug("successfully authenticated new relay managememt connection")
+
+                else:
+                    logger.warning("skipped auth handshake")
+            except (TimeoutError, ConnectionError, BrokenPipeError, Exception, ConnectionResetError):
+                inbound_ssl_socket.close()
+                return
+
+            # we have authenticated successfully! register + spin off this relay management thread
             inbound_ssl_socket.setblocking(False)
             connection_table[addr]= threading.Thread(target=relayMgmt, args=(inbound_ssl_socket, service_close_event,))
             connection_table[addr].start()
@@ -128,6 +157,18 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--auth",
+        default=str(uuid4()),
+        help="access token for local clients"
+    )
+
+    parser.add_argument(
+        "--no-auth",
+        action="store_true",
+        help="disable authentication"
+    )
+
+    parser.add_argument(
         "--passphrase",
         default='portport',
         help="passphrase for private key"
@@ -161,7 +202,14 @@ def main() -> None:
 
 
     # spin up server
-    start_relay_mgmt_server(args.port, args.key, args.cert, args.passphrase)
+    start_relay_mgmt_server(
+        args.port, 
+        args.key,
+        args.cert, 
+        args.passphrase,
+        args.auth,
+        args.no_auth
+    )
 
 
 def relayMgmt(s: ssl.SSLSocket, close_service: threading.Event):

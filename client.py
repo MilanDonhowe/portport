@@ -175,23 +175,43 @@ def create_local_proxy(local_port: int, remote_port: int, close_event: Event, to
 
 # start up procedures
 
-def create_remote_proxy(close: Event, client_socket: ssl.SSLSocket, local_port: int):
+def create_remote_proxy(close: Event, client_socket: ssl.SSLSocket, local_port: int, auth: str, skip_auth: bool):
 
     # 1. create relay connection on remote server
     logger.info("requesting relay for service hosted on port " + str(local_port))
-    
-    client_socket.sendall(PortPortMessage(PortPortMessageType.CREATE_RELAY).serialize())
-    data = client_socket.recv(4096)
 
-    # switch to non-blocking
-    client_socket.setblocking(False)
+    # attempt handshake
+    try:
+        if skip_auth == False:
+            auth_packet = PortPortMessage(PortPortMessageType.AUTH)
+            client_socket.settimeout(30.0)
+            auth_packet.auth = auth
+            client_socket.sendall(auth_packet.serialize())
+
+            auth_reply = client_socket.recv()
+            decoded_msg, _data = grab_msg(auth_reply)
+            if decoded_msg.msg_type != PortPortMessageType.AUTH_SUCCESS:
+                raise Exception("invalid auth")
+        else:
+            logger.warning("skipping auth handshake")
+        client_socket.sendall(PortPortMessage(PortPortMessageType.CREATE_RELAY).serialize())
+        data = client_socket.recv()
+
+        # switch to non-blocking
+        client_socket.setblocking(False)
+
+        result, data = grab_msg(data)
+        remote_port = result.relay_port
+    except Exception as e:
+        logger.info(f"ran into exception {e} when attempting to establish connection to relay, exiting...")
+        # in the future re-work this if client is able to support multiple connections
+        close.set()
+        return
+    
+
 
     sendq = bytes()
     recvq = bytes()
-
-    result, data = grab_msg(data)
-    remote_port = result.relay_port
-
     logger.info(f"created relay on remote port: {remote_port}")
     # create local binding
     to_remote_proxy: Queue[tuple[RelayMessageTypes, str, int, bytes, int]]  = Queue()
@@ -296,7 +316,7 @@ def create_remote_proxy(close: Event, client_socket: ssl.SSLSocket, local_port: 
     local_proxy_th.join()
 
 
-def start_client(relay_host: str, relay_port: int, local_port: int):
+def start_client(relay_host: str, relay_port: int, local_port: int, auth: str, skip_auth: bool):
     # setup TLS
     context = ssl.create_default_context()
     context.load_verify_locations("cert.pem")
@@ -313,7 +333,7 @@ def start_client(relay_host: str, relay_port: int, local_port: int):
         logger.error(f"could not connect to relay server at {relay_host}:{relay_port}")
         exit(3)
     
-    r_proxy_thread = Thread(target=create_remote_proxy, args=(close_service,client_connection_ssl,local_port,))
+    r_proxy_thread = Thread(target=create_remote_proxy, args=(close_service,client_connection_ssl,local_port,auth,skip_auth,))
     r_proxy_thread.start()
     while not close_service.is_set():
         sched_yield()
@@ -352,12 +372,25 @@ def main() -> None:
         help="verbose logging"
     )
 
+    parser.add_argument(
+        "--auth",
+        default="portport",
+        help="auth token for accessing relay",
+        required=True
+    )
+
+    parser.add_argument(
+        "--no-auth",
+        action="store_true",
+        help="skips sending auth packet when connecting"
+    )
+
     args = parser.parse_args()
     # configure logger
     configure_logger(args.verbose)
 
     # spin up client
-    start_client(args.relay_host, args.relay_port, args.local_port)
+    start_client(args.relay_host, args.relay_port, args.local_port, args.auth, args.no_auth)
     
     
 
