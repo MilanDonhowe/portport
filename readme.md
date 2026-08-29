@@ -21,10 +21,7 @@ On your local:
 And now external hosts can access your local TCP server via your VPS IP (the port on the VPS will be randomly selected, you will need to whitelist it on your VM).
 
 ### TODO:
-- [ ] let users specify preferred port list on the relay
-- [ ] add auth between relay client <--> relay server lol
 - [ ] fix bad select() that probably is busy polling
-- [ ] make ssl support not crude
 - [ ] reduce head-of-line blocking by including multiple TCP connections between server and client
 - [ ] better readme guide
 

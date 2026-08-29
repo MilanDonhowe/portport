@@ -15,18 +15,18 @@
 #===================================================================================================
 from socket import socket, SOL_SOCKET, SO_KEEPALIVE, AddressFamily, SocketKind, SO_REUSEADDR
 from threading import Thread, Event
-from server.relay import RelayMessageTypes
+from server.relay import RelayMessageTypes, QueuedRelayMessage
 from queue import Queue, Empty
 import signal, sys
 from types import FrameType
-from server.common import grab_msg, is_socket_open, configure_logger, PortPortMessageType, PortPortMessage
+from server.common import grab_msg, configure_logger, PortPortMessageType, PortPortMessage, wakeup_pair
 from os import sched_yield
 from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
 from typing import List
 import ssl
 import argparse
 import logging
-
+from collections.abc import Callable
 
 logger = logging.getLogger("portport-client")
 
@@ -57,17 +57,24 @@ def ctrl_c_handler(signum: int, frame: FrameType | None):
 signal.signal(signal.SIGINT, ctrl_c_handler)
 signal.signal(signal.SIGTERM, ctrl_c_handler)
 
+# TODO: fix the wake up socket logic here,
+# it's very hard to follow and going to cause me a head-ache later
+
 class ProxiedConnection():
     """local socket connection"""
-    def __init__(self, connection: socket, addr: tuple[str, int], recv_queue: Queue[tuple[RelayMessageTypes, str, int, bytes, int]], relay_id: int):
+    def __init__(self, connection: socket, addr: tuple[str, int], recv_queue: Queue[QueuedRelayMessage], relay_id: int, selector: DefaultSelector, wakeup_fn: Callable[[], None], wakeup_recv_handler: Callable[[], None]):
         self.conn = connection
         self.sendq = bytes()
         self.relay_id = relay_id
         self.addr = addr
         self.recv_queue = recv_queue
         self.closed_msg_sent = False # have we already sent a "CLOSE_CONNECTION" message?
+        self.write_enabled = False
+        self.selector_ref = selector
+        self.wakeup_fn_ref = wakeup_fn
+        self.wakeup_recv_handler_ref = wakeup_recv_handler
 
-    def handle_io_event(self, mask: int):
+    def handle_io_event(self, _s: socket, mask: int):
         if mask & EVENT_READ:
             try:
                 data = self.conn.recv(4096)
@@ -75,9 +82,11 @@ class ProxiedConnection():
                     # EOF
                     self.conn.close()
                     self.recv_queue.put((RelayMessageTypes.CLOSE_CONNECTION, self.addr[0], self.addr[1], data, self.relay_id))
+                    self.wakeup_recv_handler_ref()
                     self.closed_msg_sent = True
                     return
                 self.recv_queue.put((RelayMessageTypes.MESSAGE, self.addr[0], self.addr[1], data, self.relay_id))
+                self.wakeup_recv_handler_ref()
             except (ConnectionResetError, BrokenPipeError):
                 self.conn.close()
                 return
@@ -87,8 +96,13 @@ class ProxiedConnection():
             try:
                 sent_len = self.conn.send(self.sendq)
                 self.sendq = self.sendq[sent_len:]
+                if len(self.sendq) == 0:
+                    self.write_enabled = False
+                    self.selector_ref.modify(self.conn, EVENT_READ, self.handle_io_event)
+                    self.wakeup_fn_ref()
             except (ConnectionResetError, BrokenPipeError):
                 self.recv_queue.put((RelayMessageTypes.CLOSE_CONNECTION, self.addr[0], self.addr[1], b'', self.relay_id))
+                self.wakeup_recv_handler_ref()
                 self.conn.close()
                 self.closed_msg_sent = True
             except BlockingIOError:
@@ -96,13 +110,29 @@ class ProxiedConnection():
             
         
 
-def create_local_proxy(local_port: int, remote_port: int, close_event: Event, to_local: Queue[tuple[RelayMessageTypes, str, int, bytes, int]], to_proxy: Queue[tuple[RelayMessageTypes, str, int, bytes, int]]):
+def create_local_proxy(
+        local_port: int, 
+        remote_port: int, 
+        close_event: Event, 
+        to_local: Queue[QueuedRelayMessage], 
+        to_proxy: Queue[QueuedRelayMessage], 
+        wakeup_to_proxy: Callable[[],None]):
     # inbound = data from local service
     # outbound = data to local service
     selector = DefaultSelector()
     connections: dict[tuple[str,int], ProxiedConnection] = {}
+    wakeup_sock, handle_wakeup_sock, wakeup_local_proxy = wakeup_pair(close_event)
+    selector.register(wakeup_sock, EVENT_READ, handle_wakeup_sock)
 
 
+
+    def cleanup_socket(address: tuple[str, int]):
+        if address in connections:
+            selector.unregister(connections[address].conn)
+            connections[address].conn.close()
+            del connections[address]
+        else:
+            raise KeyError("address in table")
 
     while not close_event.is_set():
         # handle inbound data from relay
@@ -111,8 +141,8 @@ def create_local_proxy(local_port: int, remote_port: int, close_event: Event, to
             for _ in range(BOUNDED_BATCH):
                 msg_type, addr, port, data, _r_port = to_local.get_nowait()
                 if msg_type == RelayMessageTypes.NEW_CONNECTION:
-                    connections[(addr,port)] = ProxiedConnection(socket(AddressFamily.AF_INET, SocketKind.SOCK_STREAM), (addr, port), to_proxy, _r_port)
-                    selector.register(connections[(addr,port)].conn, EVENT_READ | EVENT_WRITE, connections[(addr,port)].handle_io_event)
+                    connections[(addr,port)] = ProxiedConnection(socket(AddressFamily.AF_INET, SocketKind.SOCK_STREAM), (addr, port), to_proxy, _r_port, selector, wakeup_local_proxy, wakeup_to_proxy)
+                    selector.register(connections[(addr,port)].conn, EVENT_READ, connections[(addr,port)].handle_io_event)
                     connections[(addr,port)].conn.setsockopt(SOL_SOCKET, SO_KEEPALIVE, 1)
                     try:
                         # .connect will block--maybe fix that in the future not sure
@@ -120,9 +150,8 @@ def create_local_proxy(local_port: int, remote_port: int, close_event: Event, to
                         connections[(addr,port)].conn.setblocking(False)
                     except ConnectionRefusedError:
                         to_proxy.put((RelayMessageTypes.CLOSE_CONNECTION, addr, port, b'', remote_port))
-                        selector.unregister(connections[(addr,port)].conn)
-                        connections[(addr,port)].conn.close() # ensure socket got cleaned up
-                        del connections[(addr,port)] # remove from dict
+                        wakeup_to_proxy()
+                        cleanup_socket((addr,port))
                         continue
                 elif msg_type == RelayMessageTypes.MESSAGE:
                     # check if socket online, then sendall
@@ -130,14 +159,15 @@ def create_local_proxy(local_port: int, remote_port: int, close_event: Event, to
                         # this should error, we're sending data to a connection we haven't setup yet
                         logger.debug("ERR: data from unknown connection " + addr + ":" + str(port))
                         to_proxy.put((RelayMessageTypes.CLOSE_CONNECTION, addr, port, b'', remote_port))
+                        wakeup_to_proxy()
                         continue
                     # data should be already decoded from base64
                     connections[(addr,port)].sendq += data
+                    if not connections[(addr,port)].write_enabled:
+                        connections[(addr,port)].write_enabled = True
+                        selector.modify(connections[(addr,port)].conn, EVENT_READ | EVENT_WRITE, connections[(addr,port)].handle_io_event)
                 elif msg_type == RelayMessageTypes.CLOSE_CONNECTION:
-                    if (addr, port) in connections:
-                        selector.unregister(connections[(addr,port)].conn)
-                        connections[(addr,port)].conn.close()
-                        del connections[(addr,port)]
+                    cleanup_socket((addr,port))
                     # otherwise we already cleaned it up, can proceed as normal
                 else:
                     # should error
@@ -149,25 +179,19 @@ def create_local_proxy(local_port: int, remote_port: int, close_event: Event, to
         # handle socket I/O
         events = selector.select(1.0)
         for key, mask in events:
-            key.data(mask)
+            key.data(key.fileobj, mask)
         
-        # clean up connections
-        to_remove: List[tuple[str, int]] = []
-        for connection in connections.values():
-            if not is_socket_open(connection.conn):
-                selector.unregister(connection.conn)
-                to_remove.append(connection.addr)
-                # make sure we notify proxy
-                if not connection.closed_msg_sent:
-                    to_proxy.put((RelayMessageTypes.CLOSE_CONNECTION, connection.addr[0], connection.addr[1], b'', connection.relay_id))
-                    connection.closed_msg_sent = True
-                    
 
-        # clean up connections dict
-        for addr in to_remove:
-            del connections[addr]
         sched_yield()
 
+    # clean up connections (these were not naturally closed)
+    for addr in list(connections.keys()):
+        relay_id = connections[addr].relay_id
+        cleanup_socket(addr)
+        to_proxy.put((RelayMessageTypes.CLOSE_CONNECTION, addr[0], addr[1], b'', relay_id))
+        wakeup_to_proxy()
+        
+                    
 
 
 
@@ -214,14 +238,19 @@ def create_remote_proxy(close: Event, client_socket: ssl.SSLSocket, local_port: 
     recvq = bytes()
     logger.info(f"created relay on remote port: {remote_port}")
     # create local binding
-    to_remote_proxy: Queue[tuple[RelayMessageTypes, str, int, bytes, int]]  = Queue()
-    from_remote_proxy: Queue[tuple[RelayMessageTypes, str, int, bytes, int]]  = Queue()
-
-    local_proxy_th = Thread(target=create_local_proxy, args=(local_port, remote_port, close, from_remote_proxy, to_remote_proxy,))
-    local_proxy_th.start()
+    to_remote_proxy: Queue[QueuedRelayMessage]  = Queue()
+    from_remote_proxy: Queue[QueuedRelayMessage]  = Queue()
 
     # switch to using selector
     selector = DefaultSelector()
+
+    # wake up for to remote_proxy
+    wakeup_sock, handle_wakeup, trigger_wakeup_remote_proxy = wakeup_pair(close)
+    selector.register(wakeup_sock, EVENT_READ, handle_wakeup)
+    write_enabled = False
+
+    local_proxy_th = Thread(target=create_local_proxy, args=(local_port, remote_port, close, from_remote_proxy, to_remote_proxy, trigger_wakeup_remote_proxy, ))
+    local_proxy_th.start()
 
 
     def handle_relay(conn: ssl.SSLSocket, mask: int):
@@ -255,6 +284,15 @@ def create_remote_proxy(close: Event, client_socket: ssl.SSLSocket, local_port: 
                 pass
         return
 
+    
+    def enqueue_sendq(data: bytes):
+        nonlocal sendq, write_enabled
+        sendq += data
+        if len(data) > 0 and write_enabled == False:
+            write_enabled = True
+            selector.modify(client_socket, EVENT_READ | EVENT_WRITE, handle_relay)
+
+
     def process_msg(msg: PortPortMessage) -> None: # type: ignore
         if msg.msg_type == PortPortMessageType.NEW_CONNECTION:
             from_remote_proxy.put((RelayMessageTypes.NEW_CONNECTION, str(msg.addr), msg.port, b'', msg.relay_port))
@@ -265,9 +303,9 @@ def create_remote_proxy(close: Event, client_socket: ssl.SSLSocket, local_port: 
         else:
             logger.error(f"unsupported message type: \"{msg.msg_type}\"")
         return
-    selector.register(client_socket, EVENT_READ | EVENT_WRITE, handle_relay)
+    selector.register(client_socket, EVENT_READ, handle_relay)
 
-    failed_decodes = 0
+
     while not close.is_set():
         events = selector.select(timeout=1)
         for key, mask in events:
@@ -277,13 +315,7 @@ def create_remote_proxy(close: Event, client_socket: ssl.SSLSocket, local_port: 
             try:
                 msg, recvq = grab_msg(recvq)
                 process_msg(msg)
-                failed_decodes = 0
             except:
-                failed_decodes += 1
-                # TODO: remove this
-                if failed_decodes > 30:
-                    logger.info("too many failed json decodes, something went wrong.  exiting...")
-                    close.set()
                 break
 
         # do we have any data to send back?
@@ -293,20 +325,20 @@ def create_remote_proxy(close: Event, client_socket: ssl.SSLSocket, local_port: 
                 # check message queue 
                 msgType, addr, port, outbound_data, r_port = to_remote_proxy.get_nowait()
                 if msgType == RelayMessageTypes.CLOSE_CONNECTION:
-                    sendq += PortPortMessage(
+                    enqueue_sendq(PortPortMessage(
                         msg_type=PortPortMessageType.CLOSE_CONNECTION,
                         conn_addr=addr,
                         conn_port=port,
                         relay_port=r_port
-                    ).serialize()
+                    ).serialize())
                 elif msgType == RelayMessageTypes.MESSAGE:
-                    sendq += PortPortMessage(
+                    enqueue_sendq(PortPortMessage(
                         msg_type=PortPortMessageType.DATA,
                         conn_addr=addr,
                         conn_port=port,
                         relay_port=r_port,
                         data=outbound_data
-                    ).serialize()
+                    ).serialize())
                 else:
                     raise Exception("Unknown RelayMessageType!")
         except Empty:
@@ -376,7 +408,7 @@ def main() -> None:
         "--auth",
         default="portport",
         help="auth token for accessing relay",
-        required=True
+        required=False
     )
 
     parser.add_argument(

@@ -1,15 +1,48 @@
 import logging, sys, struct
 from enum import IntEnum, auto
 import json
-from socket import socket, MSG_DONTWAIT, MSG_PEEK, inet_pton, AddressFamily, inet_ntop
+from socket import socket, MSG_DONTWAIT, MSG_PEEK, inet_pton, AddressFamily, inet_ntop, socketpair
 from typing import Any, Self
-from ipaddress import ip_address, IPv4Address, IPv6Address
+from threading import Event
+from ipaddress import ip_address, IPv6Address
+from selectors import EVENT_READ
+from collections.abc import Callable
 
 class RelayMessageTypes(IntEnum):
     NEW_CONNECTION = auto()
     CLOSE_CONNECTION = auto()
     MESSAGE = auto()
 
+type QueuedRelayMessage = tuple[RelayMessageTypes, str, int, bytes, int]
+
+
+def wakeup_pair(closing_event: Event) -> tuple[socket, Callable[[socket, int], None], Callable[[], None]]:
+    """
+    returns non-blocking socket pair with selector callback and wakeup function callbacks
+    """
+    recv_sock, send_sock = socketpair()
+    recv_sock.setblocking(False)
+    send_sock.setblocking(False)
+
+    def handle_wakeup(s: socket, mask: int):
+        if mask & EVENT_READ:
+            while 1:
+                try:
+                    d=s.recv(4096)
+                    if len(d)==0:
+                        # this internal socket only closes on system failures
+                        closing_event.set()
+                        break # EOF
+                except: # should be like BlockingIOError when socket is empty
+                    break
+
+    def wakeup_socket():
+        try:
+            send_sock.send(b'\xFF')
+        except BlockingIOError:
+            pass
+
+    return recv_sock, handle_wakeup, wakeup_socket
 
 def configure_logger(verbose: bool = False):
     """configure logger"""
@@ -20,6 +53,15 @@ def configure_logger(verbose: bool = False):
         ),
         stream=sys.stderr,
     )
+    pass
+
+### Exception types for PortPort comms
+class IncompleteFrame(Exception):
+    """Raised when PortPortMessage frame is incomplete"""
+    pass
+
+class PortPortBadVersion(Exception):
+    """Raised on protocol type mismatch"""
     pass
 
 # message type between PortPort client and server
@@ -41,6 +83,11 @@ class PortPortErrorTypes(IntEnum):
 
 # message between PortPort client and server
 class PortPortMessage():
+
+    VERSION = 1
+    # ethernet's max transmit unit is around 1400 bytes
+    MAX_DATA_LENGTH = 2000
+
     def __init__(
             self, 
             msg_type: PortPortMessageType, 
@@ -103,6 +150,9 @@ class PortPortMessage():
         msg_type = PortPortMessageType(data[1])
         msg_version = data[2]
 
+        if msg_version != PortPortMessage.VERSION:
+            raise PortPortBadVersion(f"unsupported PORT PORT version = {msg_version}, server running {PortPortMessage.VERSION}")
+
         if msg_type == PortPortMessageType.ERROR:
             msg_error = PortPortErrorTypes(data[3])
             return cls(msg_type=msg_type, version=msg_version, err=msg_error), data[4:]
@@ -147,7 +197,7 @@ class PortPortMessage():
                 offset += 4
                 msg_data = data[offset:offset+msg_len]
                 if len(msg_data) != msg_len:
-                    raise Exception("Incomplete buffer!")
+                    raise IncompleteFrame("pending additional DATA bytes!")
                 offset += msg_len
                 return cls(msg_type=msg_type, version=msg_version, relay_port=relay_port, conn_addr=address, conn_port=port, data=msg_data), data[offset:]
             else:
