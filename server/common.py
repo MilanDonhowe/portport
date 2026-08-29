@@ -7,6 +7,7 @@ from threading import Event
 from ipaddress import ip_address, IPv6Address
 from selectors import EVENT_READ
 from collections.abc import Callable
+from queue import Queue, Empty
 
 class RelayMessageTypes(IntEnum):
     NEW_CONNECTION = auto()
@@ -15,6 +16,26 @@ class RelayMessageTypes(IntEnum):
 
 type QueuedRelayMessage = tuple[RelayMessageTypes, str, int, bytes, int]
 
+
+class WakingRelayQueue():
+    def __init__(self, wakeup: Callable[[], None]):
+        self.Q: Queue[QueuedRelayMessage] = Queue()
+        self.wakeup = wakeup
+
+    def put(self, msg: QueuedRelayMessage):
+        self.Q.put(msg)
+        self.wakeup()
+
+    def get_nowait(self) -> None | QueuedRelayMessage:
+        try:
+            msg = self.Q.get_nowait()
+            return msg
+        except Empty:
+            return
+
+    
+
+        
 
 def wakeup_pair(closing_event: Event) -> tuple[socket, Callable[[socket, int], None], Callable[[], None]]:
     """

@@ -17,7 +17,8 @@ from os import sched_yield
 from types import FrameType
 from server.relay import Relay, RELAY_SERVER_LOGGER_NAME, QueuedRelayMessage
 from typing import Dict
-from selectors import DefaultSelector, EVENT_WRITE, EVENT_READ
+from selectors import DefaultSelector
+import selectors
 from server.crypto import generate_ssc
 from pathlib import Path
 from prometheus_client import start_http_server
@@ -234,11 +235,11 @@ def relayMgmt(s: ssl.SSLSocket, close_service: threading.Event):
     selector = DefaultSelector()
 
     wakeup_read, handle_wakeup, wakeup_management = wakeup_pair(close_thread)
-    selector.register(wakeup_read, EVENT_READ, handle_wakeup)
+    selector.register(wakeup_read, selectors.EVENT_READ, handle_wakeup)
         
     def handle_relay_client(s: ssl.SSLSocket, mask: int):
         nonlocal sendq, recvq, write_enabled
-        if mask & EVENT_WRITE and len(sendq) > 0:
+        if mask & selectors.EVENT_WRITE and len(sendq) > 0:
             try:
                 sent_len = s.send(sendq)
                 sendq = sendq[sent_len:]
@@ -250,8 +251,8 @@ def relayMgmt(s: ssl.SSLSocket, close_service: threading.Event):
                 pass
             if len(sendq) == 0:
                 write_enabled = False
-                selector.modify(s, EVENT_READ, handle_relay_client)
-        if mask & EVENT_READ:
+                selector.modify(s, selectors.EVENT_READ, handle_relay_client)
+        if mask & selectors.EVENT_READ:
             try:
                 data = s.recv(4096)
                 if len(data) == 0:
@@ -271,7 +272,7 @@ def relayMgmt(s: ssl.SSLSocket, close_service: threading.Event):
         sendq += data
         if not write_enabled and len(sendq)>0:
             write_enabled = True
-            selector.modify(s, EVENT_WRITE|EVENT_READ, handle_relay_client)
+            selector.modify(s, selectors.EVENT_WRITE|selectors.EVENT_READ, handle_relay_client)
 
 
     def process_msg(msg: PortPortMessage):
@@ -317,7 +318,7 @@ def relayMgmt(s: ssl.SSLSocket, close_service: threading.Event):
  
 
 
-    selector.register(s, EVENT_READ, handle_relay_client)
+    selector.register(s, selectors.EVENT_READ, handle_relay_client)
 
 
     # on three failed decodes, we kill the connection
@@ -342,11 +343,13 @@ def relayMgmt(s: ssl.SSLSocket, close_service: threading.Event):
                 break
         
         # handle sendq (messages from our relays to client relay mgmt connection)
-        try:
-            # should be bounded 
-            BOUNDED_BATCH=5
-            # should I handle more than one message at a time?
-            for _ in range(BOUNDED_BATCH):
+        # empty inbound queue
+        # bound to 100 msgs
+        for _ in range(100):
+            # short-circuit if close hit
+            if close_thread.is_set():
+                break
+            try:
                 msg_type, con_addr, con_port, data, relay_port = inbound_data.get_nowait()
                 if msg_type == RelayMessageTypes.MESSAGE:
                     add_to_sendq(PortPortMessage(
@@ -375,12 +378,13 @@ def relayMgmt(s: ssl.SSLSocket, close_service: threading.Event):
                     # really, we should probably raise some sort of exception here since this code path implies some unaccounted for inbound message
                     # from a proxied host payload intended for our client but for now I'm going to ignore it :)
                     pass
-        except Empty:
-            # normal: queue has no more items
-            pass
-        except Exception:
-            logger.error("unexpected error handling outbound relay queue")
-            close_thread.set()
+            except Empty:
+                # normal: queue has no more items
+                break
+            except Exception:
+                logger.error("unexpected error handling inbound relay queue")
+                close_thread.set()
+                break
         # yield control over CPU so other threads can execute
         sched_yield()
     logger.info("closing management socket")

@@ -22,7 +22,6 @@ from types import FrameType
 from server.common import grab_msg, configure_logger, PortPortMessageType, PortPortMessage, wakeup_pair
 from os import sched_yield
 from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
-from typing import List
 import ssl
 import argparse
 import logging
@@ -116,13 +115,19 @@ def create_local_proxy(
         close_event: Event, 
         to_local: Queue[QueuedRelayMessage], 
         to_proxy: Queue[QueuedRelayMessage], 
-        wakeup_to_proxy: Callable[[],None]):
+        wakeup_remote_proxy: Callable[[],None],
+        wakeup_local_sock: socket,
+        handle_wakeup_local: Callable[[socket,int], None],
+        wakeup_local_proxy: Callable[[], None]
+        ):
+    """local proxy thread that proxies connections to local service"""
     # inbound = data from local service
     # outbound = data to local service
     selector = DefaultSelector()
     connections: dict[tuple[str,int], ProxiedConnection] = {}
-    wakeup_sock, handle_wakeup_sock, wakeup_local_proxy = wakeup_pair(close_event)
-    selector.register(wakeup_sock, EVENT_READ, handle_wakeup_sock)
+
+    
+    selector.register(wakeup_local_sock, EVENT_READ, handle_wakeup_local)
 
 
 
@@ -141,7 +146,7 @@ def create_local_proxy(
             for _ in range(BOUNDED_BATCH):
                 msg_type, addr, port, data, _r_port = to_local.get_nowait()
                 if msg_type == RelayMessageTypes.NEW_CONNECTION:
-                    connections[(addr,port)] = ProxiedConnection(socket(AddressFamily.AF_INET, SocketKind.SOCK_STREAM), (addr, port), to_proxy, _r_port, selector, wakeup_local_proxy, wakeup_to_proxy)
+                    connections[(addr,port)] = ProxiedConnection(socket(AddressFamily.AF_INET, SocketKind.SOCK_STREAM), (addr, port), to_proxy, _r_port, selector, wakeup_local_proxy, wakeup_remote_proxy)
                     selector.register(connections[(addr,port)].conn, EVENT_READ, connections[(addr,port)].handle_io_event)
                     connections[(addr,port)].conn.setsockopt(SOL_SOCKET, SO_KEEPALIVE, 1)
                     try:
@@ -150,7 +155,7 @@ def create_local_proxy(
                         connections[(addr,port)].conn.setblocking(False)
                     except ConnectionRefusedError:
                         to_proxy.put((RelayMessageTypes.CLOSE_CONNECTION, addr, port, b'', remote_port))
-                        wakeup_to_proxy()
+                        wakeup_remote_proxy()
                         cleanup_socket((addr,port))
                         continue
                 elif msg_type == RelayMessageTypes.MESSAGE:
@@ -159,7 +164,7 @@ def create_local_proxy(
                         # this should error, we're sending data to a connection we haven't setup yet
                         logger.debug("ERR: data from unknown connection " + addr + ":" + str(port))
                         to_proxy.put((RelayMessageTypes.CLOSE_CONNECTION, addr, port, b'', remote_port))
-                        wakeup_to_proxy()
+                        wakeup_remote_proxy()
                         continue
                     # data should be already decoded from base64
                     connections[(addr,port)].sendq += data
@@ -189,7 +194,7 @@ def create_local_proxy(
         relay_id = connections[addr].relay_id
         cleanup_socket(addr)
         to_proxy.put((RelayMessageTypes.CLOSE_CONNECTION, addr[0], addr[1], b'', relay_id))
-        wakeup_to_proxy()
+        wakeup_remote_proxy()
         
                     
 
@@ -200,6 +205,7 @@ def create_local_proxy(
 # start up procedures
 
 def create_remote_proxy(close: Event, client_socket: ssl.SSLSocket, local_port: int, auth: str, skip_auth: bool):
+    """thread interfacing with remote proxy"""
 
     # 1. create relay connection on remote server
     logger.info("requesting relay for service hosted on port " + str(local_port))
@@ -245,11 +251,24 @@ def create_remote_proxy(close: Event, client_socket: ssl.SSLSocket, local_port: 
     selector = DefaultSelector()
 
     # wake up for to remote_proxy
-    wakeup_sock, handle_wakeup, trigger_wakeup_remote_proxy = wakeup_pair(close)
-    selector.register(wakeup_sock, EVENT_READ, handle_wakeup)
+    wakeup_remote_sock, handle_remote_wakeup, wakeup_remote_proxy = wakeup_pair(close)
+    selector.register(wakeup_remote_sock, EVENT_READ, handle_remote_wakeup)
     write_enabled = False
 
-    local_proxy_th = Thread(target=create_local_proxy, args=(local_port, remote_port, close, from_remote_proxy, to_remote_proxy, trigger_wakeup_remote_proxy, ))
+    # wake up for local proxy handing
+    wakeup_local_sock, handle_local_wakeup, wakeup_local_proxy = wakeup_pair(close)
+    
+
+    local_proxy_th = Thread(target=create_local_proxy, args=(
+        local_port, 
+        remote_port, 
+        close, 
+        from_remote_proxy, 
+        to_remote_proxy, 
+        wakeup_remote_proxy, 
+        wakeup_local_sock, 
+        handle_local_wakeup,
+         wakeup_local_proxy,))
     local_proxy_th.start()
 
 
@@ -296,10 +315,13 @@ def create_remote_proxy(close: Event, client_socket: ssl.SSLSocket, local_port: 
     def process_msg(msg: PortPortMessage) -> None: # type: ignore
         if msg.msg_type == PortPortMessageType.NEW_CONNECTION:
             from_remote_proxy.put((RelayMessageTypes.NEW_CONNECTION, str(msg.addr), msg.port, b'', msg.relay_port))
+            wakeup_local_proxy()
         elif msg.msg_type == PortPortMessageType.CLOSE_CONNECTION:
             from_remote_proxy.put((RelayMessageTypes.CLOSE_CONNECTION, str(msg.addr), msg.port, b'', msg.relay_port))
+            wakeup_local_proxy()
         elif msg.msg_type == PortPortMessageType.DATA:
             from_remote_proxy.put((RelayMessageTypes.MESSAGE, str(msg.addr), msg.port, msg.data, msg.relay_port))
+            wakeup_local_proxy()
         else:
             logger.error(f"unsupported message type: \"{msg.msg_type}\"")
         return
