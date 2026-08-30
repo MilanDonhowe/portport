@@ -11,6 +11,9 @@ from collections.abc import Callable
 RELAY_SERVER_LOGGER_NAME = "portport-server"
 
 
+class RelayNoAvailablePort(Exception):
+    pass
+
 class RelayConnection():
     def __init__(self, sck: socket.socket):
         self.sck = sck
@@ -19,7 +22,7 @@ class RelayConnection():
 
 class Relay():
     """open relay connection"""
-    def __init__(self, close: Event, inbound: Queue[QueuedRelayMessage], outbound: Queue[QueuedRelayMessage], wakeup_mgmt: Callable[[], None] , port: int = 0, backlog: int = 5, addr: str = '0.0.0.0', sock_kind: socket.SocketKind = socket.SocketKind.SOCK_STREAM):
+    def __init__(self, close: Event, inbound: Queue[QueuedRelayMessage], outbound: Queue[QueuedRelayMessage], wakeup_mgmt: Callable[[], None], port_range: None | tuple[int, int], backlog: int = 5, addr: str = '0.0.0.0', sock_kind: socket.SocketKind = socket.SocketKind.SOCK_STREAM):
         #self.connection_table: dict[tuple[str,int], socket.socket] = {}
         #self.connection_queues: dict[tuple[str,int], bytes] = {}
 
@@ -31,7 +34,6 @@ class Relay():
         self.logger = logging.getLogger(RELAY_SERVER_LOGGER_NAME)
         self.id = 0
         self.backlog = backlog
-        self.port = port
         self.addr = addr
         self.outbound = outbound
         self.inbound = inbound
@@ -63,7 +65,27 @@ class Relay():
             self._handle_wakeup)
 
         # addr should be 
-        self._sck.bind((self.addr, self.port))
+        # BIND logic
+        self.port = 0
+        if port_range != None:
+            for port in range(port_range[0], port_range[1]+1):
+                try:
+                    # .bind will raise OSError if the port is already occupied
+                    self._sck.bind((self.addr, port))
+                    # oh we got a bind!
+                    self.port = port
+                    break
+                except OSError:
+                    pass
+            if self.port == 0:
+                # okay, in this case we have tried using a port in the available range but could not find one.
+                # we cannot open a relay, so we should abort relay construction and notify the client.
+                raise RelayNoAvailablePort(f"no available port in range {port_range[0]}-{port_range[1]}")
+        else:
+            # binding to port zero will let the kernel randomly select an open port for us
+            self._sck.bind((self.addr, 0))
+
+        # we need to do this if user didn't specify a port range
         self.identifying_port = self.get_port()
         self.logger.info(f"new relay initialized at port {self.identifying_port}")
         ACTIVE_RELAYS.inc()

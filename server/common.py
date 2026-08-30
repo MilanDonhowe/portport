@@ -101,6 +101,7 @@ class PortPortErrorTypes(IntEnum):
     NO_ERROR = auto()
     RELAY_DOES_NOT_EXIST = auto()
     AUTH_FAILURE = auto()
+    RELAY_FAILURE_PORT_EXHAUSTION = auto()
 
 # message between PortPort client and server
 class PortPortMessage():

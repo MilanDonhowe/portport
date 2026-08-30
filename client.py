@@ -19,7 +19,7 @@ from server.relay import RelayMessageTypes, QueuedRelayMessage
 from queue import Queue, Empty
 import signal, sys
 from types import FrameType
-from server.common import grab_msg, configure_logger, PortPortMessageType, PortPortMessage, wakeup_pair
+from server.common import grab_msg, configure_logger, PortPortMessageType, PortPortMessage, wakeup_pair, PortPortErrorTypes
 from os import sched_yield
 from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
 import ssl
@@ -227,10 +227,23 @@ def create_remote_proxy(close: Event, client_socket: ssl.SSLSocket, local_port: 
         client_socket.sendall(PortPortMessage(PortPortMessageType.CREATE_RELAY).serialize())
         data = client_socket.recv()
 
+
+
         # switch to non-blocking
         client_socket.setblocking(False)
 
         result, data = grab_msg(data)
+
+        if result.msg_type == PortPortMessageType.ERROR:
+            logger.error(f"encountered error when trying to start up new relay: {result.error.name}. Aborting service...")
+            close.set()
+            return # short-circuit
+
+        if result.msg_type != PortPortMessageType.OPEN_RELAY:
+            logger.error(f"unexpected response from relay: {result.msg_type.name}, aborting service...")
+            close.set()
+            return
+
         remote_port = result.relay_port
     except Exception as e:
         logger.info(f"ran into exception {e} when attempting to establish connection to relay, exiting...")
@@ -318,6 +331,14 @@ def create_remote_proxy(close: Event, client_socket: ssl.SSLSocket, local_port: 
             wakeup_local_proxy()
         elif msg.msg_type == PortPortMessageType.CLOSE_CONNECTION:
             from_remote_proxy.put((RelayMessageTypes.CLOSE_CONNECTION, str(msg.addr), msg.port, b'', msg.relay_port))
+            wakeup_local_proxy()
+        elif msg.msg_type == PortPortMessageType.ERROR:
+            if msg.error == PortPortErrorTypes.RELAY_DOES_NOT_EXIST:
+                logger.error("failed to create relay, exiting service...")
+                close.set()
+            else:
+                logger.error("unhandled ERROR message from relay server, exiting service...")
+                close.set()
             wakeup_local_proxy()
         elif msg.msg_type == PortPortMessageType.DATA:
             from_remote_proxy.put((RelayMessageTypes.MESSAGE, str(msg.addr), msg.port, msg.data, msg.relay_port))

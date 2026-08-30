@@ -1,8 +1,6 @@
 # portport: small dynamic TCP reverse proxy.
 
-ngrok but slow (yet free!).
-
-DISCLAIMER: this is not well-tested, not performant, and shouldn't be used in 99.9999% of the time.
+Small reverse proxy intended for temporarily exposing locally hosted services to external hosts via remote gateway.
 
 ### Use case:
 
@@ -16,11 +14,6 @@ On your VPS (*also making sure you have the correct firewall settings):
 `python portport.py --port 5555`
 
 On your local:
-`python client.py --relay-host <RELAY_HOST> --relay-port 5555 --local-port <local port>`
+`python client.py --relay-host <RELAY_HOST> --relay-port 5555 --local-port <local port> --auth <uuid>`
 
 And now external hosts can access your local TCP server via your VPS IP (the port on the VPS will be randomly selected, you will need to whitelist it on your VM).
-
-### TODO:
-- [ ] reduce head-of-line blocking by including multiple TCP connections between server and client
-- [ ] better readme guide
-

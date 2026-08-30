@@ -15,7 +15,7 @@ from ssl import SSLWantReadError, SSLWantWriteError
 import threading
 from os import sched_yield
 from types import FrameType
-from server.relay import Relay, RELAY_SERVER_LOGGER_NAME, QueuedRelayMessage
+from server.relay import Relay, RELAY_SERVER_LOGGER_NAME, QueuedRelayMessage, RelayNoAvailablePort
 from typing import Dict
 from selectors import DefaultSelector
 import selectors
@@ -49,7 +49,7 @@ signal.signal(signal.SIGINT, ctrl_c_handler)
 signal.signal(signal.SIGTERM, ctrl_c_handler)
 
 
-def start_relay_mgmt_server(port: int, key_file: str, cert_file: str, passphrase: str, auth_token: str, auth_bypass: bool = False):
+def start_relay_mgmt_server(port: int, key_file: str, cert_file: str, passphrase: str, auth_token: str, auth_bypass: bool = False, port_range: None|tuple[int,int] = None):
 
     # SSL context
     context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
@@ -107,7 +107,7 @@ def start_relay_mgmt_server(port: int, key_file: str, cert_file: str, passphrase
 
             # we have authenticated successfully! register + spin off this relay management thread
             inbound_ssl_socket.setblocking(False)
-            connection_table[addr]= threading.Thread(target=relayMgmt, args=(inbound_ssl_socket, service_close_event,))
+            connection_table[addr]= threading.Thread(target=relayMgmt, args=(inbound_ssl_socket, service_close_event,port_range,))
             connection_table[addr].start()
         return
 
@@ -129,6 +129,22 @@ def start_relay_mgmt_server(port: int, key_file: str, cert_file: str, passphrase
         thrd.join(timeout=1.0)
     return
 
+class PortRangeParseException(Exception):
+    """"""
+    pass
+def parse_port_range(port_range: str) -> tuple[int, int]:
+    try:
+        try:
+            min_port, max_port = port_range.split("-")
+        except ValueError:
+            raise PortRangeParseException("Too many port values provided in range")
+        min_port = int(min_port, 10)
+        max_port = int(max_port, 10)
+        if min_port > max_port:
+            raise PortRangeParseException("Min port is greater than max port, should follow min-max format")
+        return (min_port, max_port)
+    except:
+        raise
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -185,7 +201,23 @@ def main() -> None:
         help="Prometheus metrics HTTP port; set to 0 to disable",
     )
 
+    parser.add_argument(
+        "--port-range",
+        default="0",
+        help='''Port range for opening external hosts with format "<min openable port>-<max openable port>"
+        For instance, 5000-5005 would result in the server attempting to open relays on port 5000, 5001, 5002, 5003, 5004 or 5005.
+        '''
+    )
+
     args = parser.parse_args()
+
+    # TODO: parse port-range
+    port_range = None
+    if args.port_range != "0":
+        try:
+            port_range = parse_port_range(args.port_range)
+        except Exception as e:
+            logger.error(f"Ran into exception when parsing provided port range={e}")
 
     # configure logger
     configure_logger(args.verbose)
@@ -212,11 +244,12 @@ def main() -> None:
         args.cert, 
         args.passphrase,
         args.auth,
-        args.no_auth
+        args.no_auth,
+        port_range
     )
 
 
-def relayMgmt(s: ssl.SSLSocket, close_service: threading.Event):
+def relayMgmt(s: ssl.SSLSocket, close_service: threading.Event, port_range: None | tuple[int, int]):
     """thread to handle relay mgmt"""
 
     # metrics
@@ -279,9 +312,15 @@ def relayMgmt(s: ssl.SSLSocket, close_service: threading.Event):
         with MESSAGE_PROCESSING_SECONDS.labels(type=msg.msg_type.name).time():
             nonlocal sendq
             if msg.msg_type == PortPortMessageType.CREATE_RELAY:
-                # wake up socket pair
-                # spawn new relay
-                new_relay = Relay(close_service, inbound_data, Queue(), wakeup_management)
+                try:
+                    # wake up socket pair
+                    # spawn new relay
+                    new_relay = Relay(close_service, inbound_data, Queue(), wakeup_management, port_range)
+                except RelayNoAvailablePort as e:
+                    logger.error(e)
+                    error_msg = PortPortMessage(msg_type=PortPortMessageType.ERROR, err=PortPortErrorTypes.RELAY_FAILURE_PORT_EXHAUSTION)
+                    add_to_sendq(error_msg.serialize())
+                    return
                 # create thread
                 new_relay_thread = threading.Thread(target=new_relay.open)
                 relays[new_relay.get_port()] = (new_relay, new_relay_thread)
