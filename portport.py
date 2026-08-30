@@ -4,26 +4,26 @@
 # 
 #
 #===================================================================================================
-from server.common import *
-from server.metrics import MGMT_CONNECTIONS, BYTES_TRANSFERRED, MESSAGE_PROCESSING_SECONDS
-from logging import getLogger
-from queue import Queue, Empty
-import socket
 import signal
 import ssl
-from ssl import SSLWantReadError, SSLWantWriteError
 import threading
+import selectors
+import argparse
+from src.common import *
+from src.metrics import MGMT_CONNECTIONS, BYTES_TRANSFERRED, MESSAGE_PROCESSING_SECONDS
+from logging import getLogger
+from queue import Queue, Empty
+from ssl import SSLWantReadError, SSLWantWriteError
 from os import sched_yield
 from types import FrameType
-from server.relay import Relay, RELAY_SERVER_LOGGER_NAME, QueuedRelayMessage, RelayNoAvailablePort
+from src.relay import Relay, RELAY_SERVER_LOGGER_NAME, QueuedRelayMessage, RelayNoAvailablePort
 from typing import Dict
-from selectors import DefaultSelector
-import selectors
-from server.crypto import generate_ssc
+from src.crypto import generate_ssc
 from pathlib import Path
 from prometheus_client import start_http_server
 from uuid import uuid4
-import argparse
+import socket
+
 
 RELAY_MGMT_PORT = 1600 
 RELAY_MGMT_ADDR = "0.0.0.0"
@@ -113,7 +113,7 @@ def start_relay_mgmt_server(port: int, key_file: str, cert_file: str, passphrase
 
     
 
-    accept_selector = DefaultSelector()
+    accept_selector = selectors.DefaultSelector()
     accept_selector.register(main_server, EVENT_READ)
     while not service_close_event.is_set():
         # new relay management connection
@@ -265,7 +265,7 @@ def relayMgmt(s: ssl.SSLSocket, close_service: threading.Event, port_range: None
     sendq: bytes = bytes()
     recvq = bytes()
     write_enabled = False
-    selector = DefaultSelector()
+    selector = selectors.DefaultSelector()
 
     wakeup_read, handle_wakeup, wakeup_management = wakeup_pair(close_thread)
     selector.register(wakeup_read, selectors.EVENT_READ, handle_wakeup)
@@ -361,7 +361,6 @@ def relayMgmt(s: ssl.SSLSocket, close_service: threading.Event, port_range: None
 
 
     # on three failed decodes, we kill the connection
-    failed_decode = 0
     while (not close_service.is_set()) and (not close_thread.is_set()):
 
         # socket I/O with proxied client
@@ -375,10 +374,19 @@ def relayMgmt(s: ssl.SSLSocket, close_service: threading.Event, port_range: None
             try:
                 msg, recvq = grab_msg(recvq)
                 process_msg(msg)
-                failed_decode = 0
-            # TODO: should probably have more intelligent error handling here
+            except PortPortBadVersion:
+                # client sending incorrect version value? we need to kill this thread
+                logger.error("detected incompatible portport msg protocol version, killing relay.")
+                # try and notify client of issue
+                add_to_sendq(PortPortMessage(msg_type=PortPortMessageType.ERROR, err=PortPortErrorTypes.INVALID_MSG_VERSION).serialize())
+                # but we need to close the relay at this point
+                close_thread.set()
+            except PortPortUnsupportedMsgType:
+                # unsupported message type, indicates somehow decode buffer got corrupted
+                logger.error("detected unsupported msg type id, killing relay")
+                add_to_sendq(PortPortMessage(msg_type=PortPortMessageType.ERROR, err=PortPortErrorTypes.UNKNOWN_MSG_TYPE).serialize())
+                close_thread.set()
             except:
-                failed_decode+=1
                 break
         
         # handle sendq (messages from our relays to client relay mgmt connection)

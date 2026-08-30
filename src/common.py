@@ -85,6 +85,10 @@ class PortPortBadVersion(Exception):
     """Raised on protocol type mismatch"""
     pass
 
+class PortPortUnsupportedMsgType(Exception):
+    """Raised when decoding an entirely unknown message type"""
+    pass
+
 # message type between PortPort client and server
 class PortPortMessageType(IntEnum):
     CREATE_RELAY = auto()
@@ -102,6 +106,8 @@ class PortPortErrorTypes(IntEnum):
     RELAY_DOES_NOT_EXIST = auto()
     AUTH_FAILURE = auto()
     RELAY_FAILURE_PORT_EXHAUSTION = auto()
+    INVALID_MSG_VERSION = auto()
+    UNKNOWN_MSG_TYPE = auto()
 
 # message between PortPort client and server
 class PortPortMessage():

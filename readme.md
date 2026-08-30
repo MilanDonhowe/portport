@@ -11,7 +11,7 @@ Assuming you have some virtual private server you can create out bound connectio
 ### Usage or quick start:
 
 On your VPS (*also making sure you have the correct firewall settings):
-`python portport.py --port 5555`
+`python portport.py --port 5555 --port-range 9000-9100`
 
 On your local:
 `python client.py --relay-host <RELAY_HOST> --relay-port 5555 --local-port <local port> --auth <uuid>`

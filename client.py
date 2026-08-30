@@ -9,7 +9,7 @@
 # services running on the host.
 #
 #
-# python client.py --relay-host <ip> --relay-port 4000 --local-port 1234 --cert <cert.pem> --key <key.pem>
+# python client.py --relay-host <ip> --relay-port 4000 --local-port 1234 --cert <cert.pem> --key <key.pem> --auth <auth token>
 # 
 # 
 #===================================================================================================
@@ -28,9 +28,6 @@ import logging
 from collections.abc import Callable
 
 logger = logging.getLogger("portport-client")
-
-
-
 
 # DEFAULTS
 LOCAL_PORT = 1234
@@ -55,9 +52,6 @@ def ctrl_c_handler(signum: int, frame: FrameType | None):
 
 signal.signal(signal.SIGINT, ctrl_c_handler)
 signal.signal(signal.SIGTERM, ctrl_c_handler)
-
-# TODO: fix the wake up socket logic here,
-# it's very hard to follow and going to cause me a head-ache later
 
 class ProxiedConnection():
     """local socket connection"""
