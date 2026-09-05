@@ -1,3 +1,6 @@
+# filename: relay.py
+# info: all primitives for handling invidiual relays (things that interface with external hosts accessing the portport relay server)
+
 import socket
 from queue import Queue
 from threading import Event
@@ -5,7 +8,7 @@ from .common import RelayMessageTypes, QueuedRelayMessage
 from os import sched_yield
 import logging
 from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
-from .metrics import ACTIVE_RELAYS, BYTES_TRANSFERRED, ACTIVE_CONNECTIONS
+from .relay_metrics import ACTIVE_RELAYS, BYTES_TRANSFERRED, ACTIVE_CONNECTIONS
 from collections.abc import Callable
 
 RELAY_SERVER_LOGGER_NAME = "portport-server"

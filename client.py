@@ -15,11 +15,11 @@
 #===================================================================================================
 from socket import socket, SOL_SOCKET, SO_KEEPALIVE, AddressFamily, SocketKind, SO_REUSEADDR
 from threading import Thread, Event
-from server.relay import RelayMessageTypes, QueuedRelayMessage
+from src.relay import RelayMessageTypes, QueuedRelayMessage
 from queue import Queue, Empty
 import signal, sys
 from types import FrameType
-from server.common import grab_msg, configure_logger, PortPortMessageType, PortPortMessage, wakeup_pair, PortPortErrorTypes
+from src.common import grab_msg, configure_logger, PortPortMessageType, PortPortMessage, wakeup_pair, PortPortErrorTypes
 from os import sched_yield
 from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
 import ssl
@@ -443,7 +443,7 @@ def main() -> None:
 
     parser.add_argument(
         "--auth",
-        default="portport",
+        default="",
         help="auth token for accessing relay",
         required=False
     )
@@ -454,9 +454,15 @@ def main() -> None:
         help="skips sending auth packet when connecting"
     )
 
+
     args = parser.parse_args()
     # configure logger
     configure_logger(args.verbose)
+
+    # is there a more idiomatic approach for this in argparse?
+    if (args.no_auth == False and len(args.auth) == 0):
+        logger.error("error: no auth token specified and --no-auth not explicitly passed.  Exiting...")
+        sys.exit(1)
 
     # spin up client
     start_client(args.relay_host, args.relay_port, args.local_port, args.auth, args.no_auth)

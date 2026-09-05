@@ -1,3 +1,7 @@
+# filename: relay_metrics.py
+# info: diagnostic metrics used for measuring performance metrics on the relay (portport) server.
+
+
 from prometheus_client import Gauge, Counter, Histogram
 
 BYTES_TRANSFERRED = Counter(

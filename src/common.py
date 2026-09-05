@@ -1,3 +1,6 @@
+# filename: common.py
+# info: common system constants and messaging standards used both on the portport server and portport client scripts.
+
 import logging, sys, struct
 from enum import IntEnum, auto
 import json

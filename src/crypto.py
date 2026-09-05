@@ -1,4 +1,6 @@
-#  filename: crypto.py
+# filename: crypto.py
+# info: handling the TLS setup for portport/relay server
+
 import datetime
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
