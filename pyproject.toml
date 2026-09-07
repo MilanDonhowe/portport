@@ -3,6 +3,10 @@ name = "portport"
 version = "0.1.0"
 requires-python = ">=3.12"
 
+[build-system]
+requires=["setuptools>=40.8.0"]
+build-backend = "setuptools.build_meta"
+
 [project.scripts]
 portport-client = "portport.client.cli:main"
 portport-server = "portport.server.cli:main"
