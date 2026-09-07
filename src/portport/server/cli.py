@@ -1,20 +1,17 @@
 #===================================================================================================
 # portport.py reverse proxy server
-# 
-# 
-#
 #===================================================================================================
 import signal
 import threading
 import argparse
-from src.common import *
+from portport.common import *
 from types import FrameType
-from src.relay import RELAY_SERVER_LOGGER_NAME
-from src.crypto import generate_ssc
+from portport.server.relay import RELAY_SERVER_LOGGER_NAME
+from portport.server.crypto import generate_ssc
 from pathlib import Path
 from prometheus_client import start_http_server
 from uuid import uuid4
-from src.relay_manager import start_relay_mgmt_server, RELAY_MGMT_PORT, parse_port_range
+from portport.server.manager import start_relay_mgmt_server, RELAY_MGMT_PORT, parse_port_range
 from logging import getLogger
 
 logger = getLogger(RELAY_SERVER_LOGGER_NAME)

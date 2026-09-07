@@ -15,11 +15,11 @@
 #===================================================================================================
 from socket import socket, SOL_SOCKET, SO_KEEPALIVE, AddressFamily, SocketKind, SO_REUSEADDR
 from threading import Thread, Event
-from src.relay import RelayMessageTypes, QueuedRelayMessage
+from portport.server.relay import RelayMessageTypes, QueuedRelayMessage
 from queue import Queue, Empty
 import signal, sys
 from types import FrameType
-from src.common import grab_msg, configure_logger, PortPortMessageType, PortPortMessage, wakeup_pair, PortPortErrorTypes
+from portport.common import grab_msg, configure_logger, PortPortMessageType, PortPortMessage, wakeup_pair, PortPortErrorTypes
 from os import sched_yield
 from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
 import ssl

@@ -2,6 +2,18 @@
 
 Small reverse proxy intended for temporarily exposing locally hosted services to external hosts via remote gateway.
 
+
+# Install Quick-State
+
+- run `python -m pip install .`
+
+Requires python >= 3.12
+
+
+### usage:
+portport-server --help
+portport-client --help
+
 ### Use case:
 
 You want to host some service from your local machine (i.e., maybe a minecraft server), but your network firewall doesn't allow for inbound traffic (i.e., the internet) to access your local machine (i.e., there's no port-forwarding on your network) and for whatever reason, you lack control over your network router settings or don't desire modifying them.

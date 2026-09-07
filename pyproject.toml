@@ -1,7 +1,8 @@
 [project]
 name = "portport"
 version = "0.1.0"
+requires-python = ">=3.12"
 
 [project.scripts]
-portport-client = "client:main"
-portport-server = "portport:main"
+portport-client = "portport.client.cli:main"
+portport-server = "portport.server.cli:main"

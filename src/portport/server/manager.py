@@ -13,12 +13,12 @@ from os import sched_yield
 from ssl import SSLWantReadError, SSLWantWriteError
 from queue import Queue, Empty
 from typing import Dict
-from .relay import RELAY_SERVER_LOGGER_NAME, Relay, RelayNoAvailablePort
-from .common import (
+from portport.server.relay import RELAY_SERVER_LOGGER_NAME, Relay, RelayNoAvailablePort
+from portport.common import (
     PortPortMessage, PortPortMessageType, PortPortErrorTypes, QueuedRelayMessage, 
     RelayMessageTypes, PortPortUnsupportedMsgType, PortPortBadVersion, grab_msg, wakeup_pair, 
 )
-from .relay_metrics import MGMT_CONNECTIONS, BYTES_TRANSFERRED, MESSAGE_PROCESSING_SECONDS
+from .metrics import MGMT_CONNECTIONS, BYTES_TRANSFERRED, MESSAGE_PROCESSING_SECONDS
 
 
 RELAY_MGMT_PORT = 1600 
