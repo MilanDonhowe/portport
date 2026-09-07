@@ -26,6 +26,7 @@ import ssl
 import argparse
 import logging
 from collections.abc import Callable
+from pathlib import Path
 
 logger = logging.getLogger("portport-client")
 
@@ -385,19 +386,26 @@ def create_remote_proxy(close: Event, client_socket: ssl.SSLSocket, local_port: 
     local_proxy_th.join()
 
 
-def start_client(relay_host: str, relay_port: int, local_port: int, auth: str, skip_auth: bool):
+def start_client(relay_host: str, relay_port: int, local_port: int, auth: str, skip_auth: bool, cert_path: str):
     # setup TLS
     context = ssl.create_default_context()
-    context.load_verify_locations("cert.pem")
+    if not Path(cert_path).is_file():
+        logger.error(f"missing certificate at --cert {cert_path}; ensure TLS certificate exists.")
+        exit(3)
+
+    context.load_verify_locations(cert_path)
 
     # connection to relay server
     client_connection = socket(AddressFamily.AF_INET, SocketKind.SOCK_STREAM)
     client_connection.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
     client_connection.setsockopt(SOL_SOCKET, SO_KEEPALIVE, 1)
 
+
     client_connection_ssl = context.wrap_socket(client_connection, server_hostname="localhost")
     try:
         client_connection_ssl.connect((relay_host, relay_port))
+    except ssl.SSLCertVerificationError:
+        logger.error(f"could not verify remote certificate.  Pass remote certificate via --cert")
     except ConnectionRefusedError:
         logger.error(f"could not connect to relay server at {relay_host}:{relay_port}")
         exit(3)
@@ -454,6 +462,13 @@ def main() -> None:
         help="skips sending auth packet when connecting"
     )
 
+    parser.add_argument(
+        "--cert",
+        default="cert.pem",
+        help="location of TLS certificate to trust",
+        required=False
+    )
+
 
     args = parser.parse_args()
     # configure logger
@@ -465,7 +480,7 @@ def main() -> None:
         sys.exit(1)
 
     # spin up client
-    start_client(args.relay_host, args.relay_port, args.local_port, args.auth, args.no_auth)
+    start_client(args.relay_host, args.relay_port, args.local_port, args.auth, args.no_auth, args.cert)
     
     
 

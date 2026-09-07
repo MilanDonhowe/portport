@@ -72,8 +72,13 @@ def start_relay_mgmt_server(service_close: threading.Event, port: int, key_file:
         if mask & selectors.EVENT_READ:
             inbound_socket, addr = listening_socket.accept()
             # apply SSL
-            inbound_ssl_socket = context.wrap_socket(inbound_socket, server_side=True, do_handshake_on_connect=True)
-            inbound_ssl_socket.settimeout(2.0) # it should be sent very quickly
+            try:
+                inbound_ssl_socket = context.wrap_socket(inbound_socket, server_side=True, do_handshake_on_connect=True)
+                inbound_ssl_socket.settimeout(2.0) # it should be sent very quickly
+            except ssl.SSLError:
+                logger.error("Ran into issue accepting inbound TLS connection, likely issue with mismatched certificated.")
+                inbound_socket.close()
+                return
             # While blocking ensure we get the Auth message
             try:
                 if auth_bypass == False:
