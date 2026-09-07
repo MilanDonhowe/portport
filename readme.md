@@ -3,11 +3,23 @@
 Small reverse proxy intended for temporarily exposing locally hosted services to external hosts via remote gateway.
 
 
-# Install Quick-State
+# Install
 
 - run `python -m pip install .`
 
 Requires python >= 3.12
+
+### Usage:
+
+On your VPS (*also making sure you have the correct firewall settings):
+
+`portport-server --port 5555 --port-range 9000-9100`
+
+On your local:
+
+`portport-client --relay-host <RELAY_HOST> --relay-port 5555 --local-port <local port> --auth <uuid>`
+
+And now external hosts can access your local TCP server via your VPS IP (the port on the VPS will be randomly selected, you will need to whitelist it on your VM).
 
 
 ### Use case:
@@ -39,14 +51,3 @@ external client C -------------> |                        |
                            +-------------------------------------------------------------------------------+          
 ```
 
-### Usage or quick start:
-
-On your VPS (*also making sure you have the correct firewall settings):
-
-`portport-server --port 5555 --port-range 9000-9100`
-
-On your local:
-
-`portport-client --relay-host <RELAY_HOST> --relay-port 5555 --local-port <local port> --auth <uuid>`
-
-And now external hosts can access your local TCP server via your VPS IP (the port on the VPS will be randomly selected, you will need to whitelist it on your VM).
