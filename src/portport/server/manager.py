@@ -1,4 +1,4 @@
-# filename: relay_manager.py
+# filename: manager.py
 # info: portport relay management thread handlers.
 #       This handles the communication between portport server (remote relay server) and the local client script.
 #       This is where the bulk of important processing happens in a portport setup as this is where the "proxying" behavior 

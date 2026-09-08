@@ -26,8 +26,6 @@ class RelayConnection():
 class Relay():
     """open relay connection"""
     def __init__(self, close: Event, inbound: Queue[QueuedRelayMessage], outbound: Queue[QueuedRelayMessage], wakeup_mgmt: Callable[[], None], port_range: None | tuple[int, int], backlog: int = 5, addr: str = '0.0.0.0', sock_kind: socket.SocketKind = socket.SocketKind.SOCK_STREAM):
-        #self.connection_table: dict[tuple[str,int], socket.socket] = {}
-        #self.connection_queues: dict[tuple[str,int], bytes] = {}
 
         # should wake up relay mgmt select()
         self.wakeup_callback = wakeup_mgmt
@@ -67,8 +65,7 @@ class Relay():
             EVENT_READ,
             self._handle_wakeup)
 
-        # addr should be 
-        # BIND logic
+        # just attempt to bind to each available port in supplied port range in ascending order
         self.port = 0
         if port_range != None:
             for port in range(port_range[0], port_range[1]+1):

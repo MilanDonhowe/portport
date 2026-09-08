@@ -7,9 +7,6 @@
 # The main idea here is we dynamically create a reverse-proxy with our relay service by initializing a TCP connection
 # from this client program and spin up as many relay endpoints (proxies) as we want and redirect their TCP traffic to
 # services running on the host.
-#
-#
-# python client.py --relay-host <ip> --relay-port 4000 --local-port 1234 --cert <cert.pem> --key <key.pem> --auth <auth token>
 # 
 # 
 #===================================================================================================

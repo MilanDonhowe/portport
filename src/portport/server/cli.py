@@ -100,7 +100,6 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    # TODO: parse port-range
     port_range = None
     if args.port_range != "0":
         try:
