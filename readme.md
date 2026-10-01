@@ -30,24 +30,17 @@ Assuming you have some virtual private server you can create out bound connectio
 
 #### Example:
 ```
-                                  remote virtual private server                                                       
-                                 +------------------------+                                                           
-external client A  ------------> |                        |                                                           
-                                 |                        |         The external clients A, B & C are able to access  
-external client B -------------> |    portport-server     |         the locally hosted service via the portport-client
-                                 |                        |                                                           
-external client C -------------> |                        |                                                           
-                                 +---------------^--------+                                                           
-                                                 |                                                                    
-                                                 |                                                                    
-                           your local system     |                                                                    
-                           +---------------------+---------------------------------------------------------+          
-                           |                     |                                                         |          
-                           |    +----------------v------+           +----------------------------------+   |          
-                           |    |                       |           |                                  |   |          
-                           |    |   portport-client     |<--------->|     service on localhost:9999    |   |          
-                           |    |                       |           |                                  |   |          
-                           |    +-----------------------+           +----------------------------------+   |          
-                           +-------------------------------------------------------------------------------+          
+           +------------+                           
+client B-->| portport   |     external clients A & B
+client A-->| server     |     are able to access the
+           +-----^------+     locally hosted service
+                 |            at localhost:9999     
+      your system|                                  
+         +-------+--------------------------------+ 
+         | +-----v------+     +----------------+  | 
+         | | portport   |     | service on     |  | 
+         | | client     <-----> localhost:9999 |  | 
+         | +------------+     +----------------+  | 
+         +----------------------------------------+ 
 ```
 
